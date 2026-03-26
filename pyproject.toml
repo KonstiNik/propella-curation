@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "propella-curation"
+version = "0.1.0"
+description = "Score-based data sampling for SFT quality filtering using propella annotations."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "datasets",
+    "pyarrow",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+propella-score-sampler = "propella_curation.score_sampler:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+propella_curation = ["configs/*.yaml"]

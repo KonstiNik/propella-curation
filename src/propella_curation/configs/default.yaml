@@ -1,0 +1,14 @@
+aggregation: weighted_mean
+missing_id_score: 0.0
+normalize: true
+
+columns:
+  content_quality:
+    weight: 1.0
+    default_score: 0.5
+    category_scores:
+      excellent: 1.0
+      good: 0.75
+      adequate: 0.4
+      poor: 0.1
+      unacceptable: 0.0

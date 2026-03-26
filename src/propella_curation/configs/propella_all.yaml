@@ -1,0 +1,73 @@
+aggregation: weighted_mean
+missing_id_score: 0.0
+normalize: true
+
+columns:
+  content_quality:
+    weight: 3.0
+    default_score: 0.5
+    category_scores:
+      excellent: 1.0
+      good: 0.75
+      adequate: 0.4
+      poor: 0.1
+      unacceptable: 0.0
+
+  content_safety:
+    weight: 5.0
+    default_score: 0.5
+    category_scores:
+      safe: 1.0
+      mild_concerns: 0.5
+      nsfw: 0.0
+      harmful: 0.0
+      illegal: 0.0
+
+  educational_value:
+    weight: 2.0
+    default_score: 0.5
+    category_scores:
+      high: 1.0
+      moderate: 0.7
+      basic: 0.4
+      minimal: 0.15
+      none: 0.0
+
+  reasoning_indicators:
+    weight: 1.5
+    default_score: 0.5
+    category_scores:
+      analytical: 1.0
+      explanatory: 0.7
+      basic_reasoning: 0.4
+      minimal: 0.15
+      none: 0.0
+
+  content_integrity:
+    weight: 2.0
+    default_score: 0.5
+    category_scores:
+      complete: 1.0
+      mostly_complete: 0.7
+      fragment: 0.2
+      severely_degraded: 0.0
+
+  information_density:
+    weight: 1.0
+    default_score: 0.5
+    category_scores:
+      dense: 1.0
+      adequate: 0.7
+      moderate: 0.4
+      thin: 0.15
+      empty: 0.0
+
+  commercial_bias:
+    weight: 1.5
+    default_score: 0.5
+    category_scores:
+      none: 1.0
+      minimal: 0.8
+      moderate: 0.4
+      heavy: 0.1
+      pure_marketing: 0.0
