@@ -6,6 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "propella-curation"
 version = "0.1.0"
 description = "Score-based data sampling for SFT quality filtering using propella annotations."
+license = {text = "Apache-2.0"}
+authors = [{name = "Konstantin Nikolaou"}]
 requires-python = ">=3.10"
 dependencies = [
     "numpy",

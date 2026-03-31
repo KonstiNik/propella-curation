@@ -13,9 +13,13 @@ import pytest
 import yaml
 from datasets import Dataset
 
-from propella_curation import ScoreSampler, ScoringConfig, ColumnScoring, DEFAULT_SCORING_CONFIG
+from propella_curation import (
+    DEFAULT_SCORING_CONFIG,
+    ColumnScoring,
+    ScoreSampler,
+    ScoringConfig,
+)
 from propella_curation.labels import ORDINAL_LABELS
-
 
 # ============================================================
 # Fixtures — synthetic data matching real schema
@@ -24,13 +28,20 @@ from propella_curation.labels import ORDINAL_LABELS
 
 def _make_dataset(n: int = 100, id_prefix: str = "doc") -> Dataset:
     """Create a synthetic HF dataset with id and messages columns."""
-    return Dataset.from_dict({
-        "id": [f"{id_prefix}_{i}" for i in range(n)],
-        "messages": [[{"role": "user", "content": f"question {i}"},
-                       {"role": "assistant", "content": f"answer {i}"}] for i in range(n)],
-        "source_dataset": ["test_source"] * n,
-        "domain": ["test_domain"] * n,
-    })
+    return Dataset.from_dict(
+        {
+            "id": [f"{id_prefix}_{i}" for i in range(n)],
+            "messages": [
+                [
+                    {"role": "user", "content": f"question {i}"},
+                    {"role": "assistant", "content": f"answer {i}"},
+                ]
+                for i in range(n)
+            ],
+            "source_dataset": ["test_source"] * n,
+            "domain": ["test_domain"] * n,
+        }
+    )
 
 
 _COL_PARAM_MAP = {
@@ -58,9 +69,13 @@ def _make_annotations_df(
     n = len(ids)
     rng = np.random.default_rng(0)
     overrides = {
-        "quality": quality, "safety": safety, "integrity": integrity,
-        "density": density, "educational": educational,
-        "reasoning": reasoning, "commercial": commercial,
+        "quality": quality,
+        "safety": safety,
+        "integrity": integrity,
+        "density": density,
+        "educational": educational,
+        "reasoning": reasoning,
+        "commercial": commercial,
     }
     data: dict[str, list[str]] = {"id": ids}
     for param, col_name in _COL_PARAM_MAP.items():
@@ -144,11 +159,13 @@ class TestComputeScores:
             normalize=False,
         )
         sampler = ScoreSampler(config=config)
-        df = pd.DataFrame({
-            "id": ["a"],
-            "content_quality": ["good"],
-            "content_safety": ["safe"],
-        })
+        df = pd.DataFrame(
+            {
+                "id": ["a"],
+                "content_quality": ["good"],
+                "content_safety": ["safe"],
+            }
+        )
         scores = sampler.compute_scores(df)
         expected = (0.8 * 2.0 + 1.0 * 3.0) / (2.0 + 3.0)
         np.testing.assert_allclose(scores.values, [expected])
@@ -169,11 +186,13 @@ class TestComputeScores:
             normalize=False,
         )
         sampler = ScoreSampler(config=config)
-        df = pd.DataFrame({
-            "id": ["a"],
-            "content_quality": ["good"],
-            "content_safety": ["safe"],
-        })
+        df = pd.DataFrame(
+            {
+                "id": ["a"],
+                "content_quality": ["good"],
+                "content_safety": ["safe"],
+            }
+        )
         scores = sampler.compute_scores(df)
         expected = 0.8 * 2.0 + 1.0 * 3.0
         np.testing.assert_allclose(scores.values, [expected])
@@ -194,11 +213,13 @@ class TestComputeScores:
             normalize=False,
         )
         sampler = ScoreSampler(config=config)
-        df = pd.DataFrame({
-            "id": ["a"],
-            "content_quality": ["good"],
-            "content_safety": ["safe"],
-        })
+        df = pd.DataFrame(
+            {
+                "id": ["a"],
+                "content_quality": ["good"],
+                "content_safety": ["safe"],
+            }
+        )
         scores = sampler.compute_scores(df)
         np.testing.assert_allclose(scores.values, [0.8])
 
@@ -218,11 +239,13 @@ class TestComputeScores:
             normalize=False,
         )
         sampler = ScoreSampler(config=config)
-        df = pd.DataFrame({
-            "id": ["a"],
-            "content_quality": ["good"],
-            "content_safety": ["safe"],
-        })
+        df = pd.DataFrame(
+            {
+                "id": ["a"],
+                "content_quality": ["good"],
+                "content_safety": ["safe"],
+            }
+        )
         scores = sampler.compute_scores(df)
         np.testing.assert_allclose(scores.values, [0.8 * 0.5])
 
@@ -369,18 +392,21 @@ class TestScoringConfig:
 
     def test_from_file(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-            yaml.dump({
-                "aggregation": "min",
-                "normalize": False,
-                "missing_id_score": 0.5,
-                "columns": {
-                    "content_quality": {
-                        "weight": 2.0,
-                        "default_score": 0.3,
-                        "category_scores": {"good": 0.9, "bad": 0.1},
+            yaml.dump(
+                {
+                    "aggregation": "min",
+                    "normalize": False,
+                    "missing_id_score": 0.5,
+                    "columns": {
+                        "content_quality": {
+                            "weight": 2.0,
+                            "default_score": 0.3,
+                            "category_scores": {"good": 0.9, "bad": 0.1},
+                        },
                     },
                 },
-            }, f)
+                f,
+            )
             f.flush()
             config = ScoringConfig.from_file(f.name)
         os.unlink(f.name)
@@ -390,7 +416,10 @@ class TestScoringConfig:
         assert config.missing_id_score == 0.5
         assert config.columns["content_quality"].weight == 2.0
         assert config.columns["content_quality"].default_score == 0.3
-        assert config.columns["content_quality"].category_scores == {"good": 0.9, "bad": 0.1}
+        assert config.columns["content_quality"].category_scores == {
+            "good": 0.9,
+            "bad": 0.1,
+        }
 
     def test_default_scoring_config_loads(self):
         """DEFAULT_SCORING_CONFIG should be loaded from default.yaml at import time."""
@@ -420,9 +449,14 @@ class TestIDMatchValidation:
             ann_path = _write_annotations_parquet(ann_df, tmpdir)
             config = _simple_config()
             sampler = ScoreSampler(config=config)
-            return sampler.apply(
-                ds, ann_path, mode="threshold", threshold=0.0, force=force,
+            result, _ = sampler.apply(
+                ds,
+                ann_path,
+                mode="threshold",
+                threshold=0.0,
+                force=force,
             )
+            return result
 
     def test_below_20_raises(self):
         with pytest.raises(ValueError, match="Only 10.0% of dataset IDs"):
@@ -471,7 +505,7 @@ class TestApplyIntegration:
             ds, ann_path, _ = self._setup(tmpdir)
             config = _simple_config()
             sampler = ScoreSampler(config=config)
-            result = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
+            result, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
             assert len(result) < len(ds)
             assert len(result) > 0
             # All remaining IDs should exist in original
@@ -483,9 +517,12 @@ class TestApplyIntegration:
             config = _simple_config()
             sampler = ScoreSampler(config=config)
             n_samples = 20
-            result = sampler.apply(
-                ds, ann_path, mode="sample_without_replacement",
-                n_samples=n_samples, seed=42,
+            result, _ = sampler.apply(
+                ds,
+                ann_path,
+                mode="sample_without_replacement",
+                n_samples=n_samples,
+                seed=42,
             )
             assert len(result) == n_samples
             # No duplicate IDs
@@ -496,9 +533,12 @@ class TestApplyIntegration:
             ds, ann_path, _ = self._setup(tmpdir, n=5)
             config = _simple_config()
             sampler = ScoreSampler(config=config)
-            result = sampler.apply(
-                ds, ann_path, mode="sample_with_replacement",
-                n_samples=50, seed=42,
+            result, _ = sampler.apply(
+                ds,
+                ann_path,
+                mode="sample_with_replacement",
+                n_samples=50,
+                seed=42,
             )
             assert len(result) == 50
             # With 50 samples from 5 examples, must have duplicates
@@ -509,7 +549,7 @@ class TestApplyIntegration:
             ds, ann_path, _ = self._setup(tmpdir)
             config = ScoringConfig.from_name("propella_all")
             sampler = ScoreSampler(config=config)
-            result = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
+            result, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
             assert len(result) <= len(ds)
 
     def test_custom_yaml_config(self):
@@ -518,39 +558,42 @@ class TestApplyIntegration:
 
             config_path = os.path.join(tmpdir, "custom.yaml")
             with open(config_path, "w") as f:
-                yaml.dump({
-                    "aggregation": "weighted_mean",
-                    "normalize": True,
-                    "missing_id_score": 0.0,
-                    "columns": {
-                        "content_quality": {
-                            "weight": 1.0,
-                            "default_score": 0.5,
-                            "category_scores": {
-                                "excellent": 1.0,
-                                "good": 0.75,
-                                "adequate": 0.4,
-                                "poor": 0.1,
-                                "unacceptable": 0.0,
+                yaml.dump(
+                    {
+                        "aggregation": "weighted_mean",
+                        "normalize": True,
+                        "missing_id_score": 0.0,
+                        "columns": {
+                            "content_quality": {
+                                "weight": 1.0,
+                                "default_score": 0.5,
+                                "category_scores": {
+                                    "excellent": 1.0,
+                                    "good": 0.75,
+                                    "adequate": 0.4,
+                                    "poor": 0.1,
+                                    "unacceptable": 0.0,
+                                },
                             },
-                        },
-                        "content_safety": {
-                            "weight": 10.0,
-                            "default_score": 0.0,
-                            "category_scores": {
-                                "safe": 1.0,
-                                "mild_concerns": 0.5,
-                                "nsfw": 0.0,
-                                "harmful": 0.0,
-                                "illegal": 0.0,
+                            "content_safety": {
+                                "weight": 10.0,
+                                "default_score": 0.0,
+                                "category_scores": {
+                                    "safe": 1.0,
+                                    "mild_concerns": 0.5,
+                                    "nsfw": 0.0,
+                                    "harmful": 0.0,
+                                    "illegal": 0.0,
+                                },
                             },
                         },
                     },
-                }, f)
+                    f,
+                )
 
             config = ScoringConfig.from_file(config_path)
             sampler = ScoreSampler(config=config)
-            result = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
+            result, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
             assert len(result) <= len(ds)
 
     def test_output_preserves_columns(self):
@@ -558,7 +601,7 @@ class TestApplyIntegration:
             ds, ann_path, _ = self._setup(tmpdir)
             config = _simple_config()
             sampler = ScoreSampler(config=config)
-            result = sampler.apply(ds, ann_path, mode="threshold", threshold=0.0)
+            result, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.0)
             assert result.column_names == ds.column_names
 
     def test_seed_reproducibility(self):
@@ -566,12 +609,18 @@ class TestApplyIntegration:
             ds, ann_path, _ = self._setup(tmpdir)
             config = _simple_config()
             sampler = ScoreSampler(config=config)
-            r1 = sampler.apply(
-                ds, ann_path, mode="sample_without_replacement",
-                n_samples=10, seed=99,
+            r1, _ = sampler.apply(
+                ds,
+                ann_path,
+                mode="sample_without_replacement",
+                n_samples=10,
+                seed=99,
             )
-            r2 = sampler.apply(
-                ds, ann_path, mode="sample_without_replacement",
-                n_samples=10, seed=99,
+            r2, _ = sampler.apply(
+                ds,
+                ann_path,
+                mode="sample_without_replacement",
+                n_samples=10,
+                seed=99,
             )
             assert r1["id"] == r2["id"]

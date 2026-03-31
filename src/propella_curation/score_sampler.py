@@ -7,35 +7,36 @@ from categorical labels, and selects examples via one of three strategies:
   - sample_without_replacement:    draw N examples, P(select) proportional to score
   - sample_with_replacement:       same, but examples can repeat (oversample high-quality)
 
-Usage (standalone):
-    python score_sampler.py \
-        --dataset_path /path/to/dolci_instruct_sft/data \
-        --annotations_path /path/to/propella_annotations/shard000000.parquet \
-        --output_dir /path/to/filtered_dataset \
+Usage (CLI):
+    propella-score-sampler \
+        --dataset_path /path/to/dataset \
+        --annotations_path /path/to/annotations.parquet \
+        --output_dir /path/to/output \
         --mode threshold --threshold 0.7 --seed 42
 
-Usage (as library):
-    from propella_curation.score_sampler import ScoreSampler, DEFAULT_SCORING_CONFIG
-    sampler = ScoreSampler(config=DEFAULT_SCORING_CONFIG)
-    filtered_ds = sampler.apply(dataset, annotations_path, mode="threshold", threshold=0.7)
+Usage (library):
+    from propella_curation import ScoreSampler
+    sampler = ScoreSampler()
+    filtered, scores = sampler.apply(dataset, "annotations.parquet", mode="threshold", threshold=0.7)
 """
 
 from __future__ import annotations
 
 import argparse
+import glob as globmod
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Literal, Optional
 
-logger = logging.getLogger(__name__)
-
-import yaml
-
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
+import yaml
 from datasets import Dataset, load_dataset
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -59,7 +60,9 @@ class ScoringConfig:
     """Complete scoring configuration."""
 
     columns: Dict[str, ColumnScoring]
-    aggregation: Literal["weighted_mean", "weighted_sum", "min", "product"] = "weighted_mean"
+    aggregation: Literal["weighted_mean", "weighted_sum", "min", "product"] = (
+        "weighted_mean"
+    )
     missing_id_score: float = 0.0  # score assigned when an ID has no annotation
     normalize: bool = True  # min-max rescale final scores to [0, 1]
 
@@ -135,7 +138,9 @@ class ScoreSampler:
         for col_name, col_cfg in self.config.columns.items():
             if col_name not in df.columns:
                 continue
-            mapped = df[col_name].map(col_cfg.category_scores).fillna(col_cfg.default_score)
+            mapped = (
+                df[col_name].map(col_cfg.category_scores).fillna(col_cfg.default_score)
+            )
             col_scores.append(mapped)
             weights.append(col_cfg.weight)
 
@@ -206,13 +211,15 @@ class ScoreSampler:
         self,
         dataset: Dataset,
         annotations_path: str,
-        mode: Literal["threshold", "sample_without_replacement", "sample_with_replacement"],
+        mode: Literal[
+            "threshold", "sample_without_replacement", "sample_with_replacement"
+        ],
         threshold: float = 0.5,
         n_samples: Optional[int] = None,
         seed: int = 42,
         force: bool = False,
-    ) -> Dataset:
-        """Apply score-based selection and return a filtered / resampled Dataset."""
+    ) -> tuple[Dataset, np.ndarray]:
+        """Apply score-based selection and return (filtered Dataset, selected scores)."""
         print("Score Sampler")
         print("=" * 50)
 
@@ -267,12 +274,14 @@ class ScoreSampler:
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
-        print(f"  Selected:           {len(indices):,} examples "
-              f"({len(indices) / len(dataset) * 100:.1f}% of original)")
+        print(
+            f"  Selected:           {len(indices):,} examples "
+            f"({len(indices) / len(dataset) * 100:.1f}% of original)"
+        )
         self._print_score_distribution(scores[indices], label="after selection")
         print("=" * 50)
 
-        return dataset.select(indices)
+        return dataset.select(indices), scores[indices]
 
     # ------------------------------------------------------------------
     # Logging
@@ -281,12 +290,16 @@ class ScoreSampler:
     @staticmethod
     def _print_score_distribution(scores: np.ndarray, label: str) -> None:
         print(f"\n  Score distribution ({label}):")
-        print(f"    Mean={scores.mean():.3f}  Median={np.median(scores):.3f}  "
-              f"Std={scores.std():.3f}")
+        print(
+            f"    Mean={scores.mean():.3f}  Median={np.median(scores):.3f}  "
+            f"Std={scores.std():.3f}"
+        )
         print(f"    Min={scores.min():.3f}  Max={scores.max():.3f}")
         pcts = np.percentile(scores, [10, 25, 50, 75, 90])
-        print(f"    p10={pcts[0]:.3f}  p25={pcts[1]:.3f}  p50={pcts[2]:.3f}  "
-              f"p75={pcts[3]:.3f}  p90={pcts[4]:.3f}")
+        print(
+            f"    p10={pcts[0]:.3f}  p25={pcts[1]:.3f}  p50={pcts[2]:.3f}  "
+            f"p75={pcts[3]:.3f}  p90={pcts[4]:.3f}"
+        )
 
 
 # ============================================================
@@ -299,40 +312,79 @@ def main() -> None:
         description="Score-based sampling for SFT datasets using propella annotations.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--dataset_path", required=True,
-        help="Path to local parquet directory or HuggingFace dataset name",
+
+    required = parser.add_argument_group("required arguments")
+    required.add_argument(
+        "--dataset_path",
+        required=True,
+        help="Path to local dataset directory (looks for parquets in data/ subdirectory, "
+        "then falls back to the given path) or HuggingFace dataset name",
     )
-    parser.add_argument(
-        "--dataset_split", default="train",
-        help="Dataset split to load (default: train)",
-    )
-    parser.add_argument(
-        "--annotations_path", required=True,
+    required.add_argument(
+        "--annotations_path",
+        required=True,
         help="Path to propella-annotations parquet file or directory",
     )
-    parser.add_argument(
-        "--output_dir", required=True,
-        help="Directory to save the filtered dataset (HF arrow format)",
+    required.add_argument(
+        "--output_dir",
+        required=True,
+        help="Directory to save the filtered dataset (parquet shards)",
     )
-    parser.add_argument(
-        "--mode", required=True,
+    required.add_argument(
+        "--mode",
+        required=True,
         choices=["threshold", "sample_without_replacement", "sample_with_replacement"],
+        help="Selection strategy. 'threshold' keeps all examples with score >= --threshold. "
+        "'sample_without_replacement' draws --n_samples examples weighted by score (no repeats). "
+        "'sample_with_replacement' allows repeats, enabling oversampling of high-quality examples.",
     )
-    parser.add_argument(
-        "--config", default=None,
+
+    optional = parser.add_argument_group("optional arguments")
+    optional.add_argument(
+        "--dataset_split",
+        default="train",
+        help="Dataset split to load (default: train)",
+    )
+    optional.add_argument(
+        "--config",
+        default=None,
         help="Scoring config: a bundled name (e.g. 'propella_all') or path to a YAML file. "
-             "Defaults to 'default' (content_quality only).",
+        "Defaults to 'default' (content_quality only).",
     )
-    parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--n_samples", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--force", action="store_true",
+    optional.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Minimum score to keep an example (only used with --mode threshold). Default: 0.5.",
+    )
+    optional.add_argument(
+        "--n_samples",
+        type=int,
+        default=None,
+        help="Number of examples to draw (only used with sampling modes). "
+        "Defaults to dataset size. Set higher than dataset size with "
+        "'sample_with_replacement' to oversample.",
+    )
+    optional.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible sampling. Default: 42.",
+    )
+    optional.add_argument(
+        "--force",
+        action="store_true",
         help="Continue even if less than 20%% of dataset IDs have annotations.",
     )
 
     args = parser.parse_args()
+
+    print(f"propella-score-sampler")
+    print(f"  Dataset:     {args.dataset_path}")
+    print(f"  Annotations: {args.annotations_path}")
+    print(f"  Output:      {args.output_dir}")
+    print(f"  Mode:        {args.mode}")
+    print(f"  Config:      {args.config or 'default'}")
 
     # Load scoring config
     if args.config is None:
@@ -343,14 +395,30 @@ def main() -> None:
         config = ScoringConfig.from_name(args.config)
 
     # Load dataset — local parquet directory or HF name
+    print(f"\nLoading dataset from {args.dataset_path} ...")
     if os.path.exists(args.dataset_path):
-        ds = load_dataset("parquet", data_files=f"{args.dataset_path}/*.parquet", split=args.dataset_split)
+        data_subdir = os.path.join(args.dataset_path, "data")
+        if os.path.isdir(data_subdir) and globmod.glob(f"{data_subdir}/*.parquet"):
+            parquet_dir = data_subdir
+        else:
+            parquet_dir = args.dataset_path
+        source_files = sorted(globmod.glob(f"{parquet_dir}/*.parquet"))
+        if not source_files:
+            raise FileNotFoundError(f"No .parquet files found in {parquet_dir}")
+        ds = load_dataset("parquet", data_files=source_files, split=args.dataset_split)
     else:
+        source_files = []
         ds = load_dataset(args.dataset_path, split=args.dataset_split)
     print(f"Loaded dataset: {len(ds):,} rows, columns: {ds.column_names}")
 
+    # Estimate rows per shard from source parquet files
+    if source_files:
+        rows_per_shard = len(ds) // len(source_files)
+    else:
+        rows_per_shard = len(ds)
+
     sampler = ScoreSampler(config=config)
-    filtered = sampler.apply(
+    filtered, scores_after = sampler.apply(
         ds,
         annotations_path=args.annotations_path,
         mode=args.mode,
@@ -360,9 +428,39 @@ def main() -> None:
         force=args.force,
     )
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    filtered.save_to_disk(args.output_dir)
-    print(f"\nSaved {len(filtered):,} examples to {args.output_dir}")
+    data_dir = os.path.join(args.output_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    table = filtered.data.table
+    n_shards = max(1, (len(filtered) + rows_per_shard - 1) // rows_per_shard)
+    for i in range(n_shards):
+        start = i * rows_per_shard
+        end = min((i + 1) * rows_per_shard, len(filtered))
+        shard = table.slice(start, end - start)
+        shard_path = os.path.join(data_dir, f"train-{i:05d}-of-{n_shards:05d}.parquet")
+        pq.write_table(shard, shard_path, use_dictionary=True, compression="snappy")
+
+    ratio = len(filtered) / len(ds)
+    print(f"\nSaved {len(filtered):,} examples to {data_dir}/ ({n_shards} shards)")
+    print(f"  Selection ratio: {ratio:.2f}x ({ratio * 100:.1f}% of original)")
+
+    # Write dataset card
+    from propella_curation.dataset_card import CurationInfo, write_dataset_card
+
+    card_info = CurationInfo(
+        name=Path(args.output_dir).name,
+        source_dataset=args.dataset_path,
+        annotations_path=args.annotations_path,
+        config_name=args.config or "default",
+        mode=args.mode,
+        threshold=args.threshold,
+        n_samples=args.n_samples,
+        seed=args.seed,
+        source_rows=len(ds),
+        selected_rows=len(filtered),
+        scores_after=scores_after,
+    )
+    write_dataset_card(card_info, args.output_dir)
+    print(f"  Dataset card written to {args.output_dir}/README.md")
 
 
 if __name__ == "__main__":

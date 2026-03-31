@@ -22,3 +22,9 @@ uv.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs
+logs/
+
+# Personal submission scripts
+submit_curation.sh

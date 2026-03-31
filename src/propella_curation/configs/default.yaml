@@ -5,7 +5,7 @@ normalize: true
 columns:
   content_quality:
     weight: 1.0
-    default_score: 0.5
+    default_score: 0.0
     category_scores:
       excellent: 1.0
       good: 0.75

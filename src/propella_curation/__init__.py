@@ -6,7 +6,12 @@ from propella_curation.labels import (
     ORDINAL_LABELS,
     SCORE_MAPS,
 )
-from propella_curation.score_sampler import ScoreSampler, ScoringConfig, ColumnScoring, DEFAULT_SCORING_CONFIG
+from propella_curation.score_sampler import (
+    DEFAULT_SCORING_CONFIG,
+    ColumnScoring,
+    ScoreSampler,
+    ScoringConfig,
+)
 
 __all__ = [
     "ScoreSampler",
