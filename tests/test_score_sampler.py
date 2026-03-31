@@ -362,6 +362,20 @@ class TestSelectProbabilistic:
         with pytest.raises(ValueError, match="All scores are zero"):
             ScoreSampler._select_probabilistic(scores, 2, replace=False, rng=rng)
 
+    def test_sampling_proportional_to_scores(self):
+        """Higher-scored examples should be selected proportionally more often."""
+        scores = np.array([0.1, 0.2, 0.3, 0.4])
+        expected_probs = scores / scores.sum()  # [0.1, 0.2, 0.3, 0.4]
+        n_draws = 100_000
+        rng = np.random.default_rng(42)
+        indices = ScoreSampler._select_probabilistic(
+            scores, n_draws, replace=True, rng=rng,
+        )
+        counts = np.bincount(indices, minlength=len(scores))
+        observed_probs = counts / n_draws
+        # With 100k draws, observed frequencies should be close to expected
+        np.testing.assert_allclose(observed_probs, expected_probs, atol=0.01)
+
     def test_without_replacement_caps_n_samples(self):
         scores = np.array([0.0, 0.5, 0.0, 0.8])  # only 2 non-zero
         rng = np.random.default_rng(42)
