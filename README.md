@@ -26,7 +26,11 @@ from datasets import load_dataset
 ds = load_dataset("parquet", data_files="data/*.parquet", split="train")
 
 sampler = ScoreSampler()  # default: scores on content_quality only
-filtered, scores = sampler.apply(ds, "annotations.parquet", mode="threshold", threshold=0.7)
+filtered, scores, indices = sampler.apply(
+    ds, "annotations.parquet", mode="threshold", threshold=0.7
+)
+# `indices` are int64 source-table positions; for sample_with_replacement
+# they may contain duplicates.
 
 # use a different bundled config
 sampler = ScoreSampler(config=ScoringConfig.from_name("propella_all"))
@@ -45,7 +49,21 @@ propella-score-sampler \
   --mode threshold --threshold 0.7
 ```
 
-`--dataset_path` accepts either a HuggingFace dataset directory (with a `data/` subdirectory containing parquets) or a direct path to a directory of parquet files.
+To **oversample** high-quality examples (draw with replacement, weighted by score), use `sample_with_replacement` and set `--n_samples` larger than the source size. Optionally cap how many times any single example may be duplicated with `--max_duplications`:
+
+```bash
+propella-score-sampler \
+  --dataset_path /path/to/dataset \
+  --annotations_path /path/to/annotations.parquet \
+  --output_dir /path/to/output \
+  --mode sample_with_replacement \
+  --n_samples 4000000 \
+  --max_duplications 5
+```
+
+If `--n_samples` exceeds `--max_duplications × (number of examples with score > 0)`, it is capped to that capacity.
+
+`--dataset_path` accepts a local HuggingFace dataset directory (with a `data/` subdirectory containing parquets) or a direct path to a directory of parquet files. HF Hub dataset names are accepted only with `--writer stream`; the default `--writer load` requires local parquet files it can re-decode.
 
 Use `--config propella_all` for all 7 annotation columns, or `--config /path/to/custom.yaml` for a custom config. See `propella-score-sampler --help` for all options.
 
@@ -66,7 +84,9 @@ Shard sizes are matched to the source dataset. The dataset card records the sour
 
 ### Resource requirements
 
-The current implementation loads the full dataset into memory. Expect **~2x the uncompressed dataset size** in peak memory (check `num_bytes` in your dataset's `dataset_info`). Processing time scales linearly — ~2M rows takes ~2 minutes.
+By default (`--writer load`) the source dataset is fully decoded into memory before writing shards. Expect peak RAM ≈ decoded source size + one shard (typically ~3–5× the compressed parquet size). The output preserves the sampler's draw order. Processing time scales linearly — ~2M rows takes ~2 minutes.
+
+For sources that don't fit in node RAM, pass `--writer stream`. This accesses source parquets via mmap and gathers one shard at a time, keeping peak RAM at ~one shard. **Output rows are reordered** (sorted by source row position) rather than preserved in sampler draw order. This is invisible to most training pipelines because dataloaders shuffle every epoch, but if you depend on the exact draw order downstream, use the default.
 
 For SLURM clusters, a minimal submission looks like:
 
@@ -76,4 +96,4 @@ sbatch --wrap="propella-score-sampler --dataset_path ... --output_dir ..." \
   --time=00:30:00 --mem=64G --cpus-per-task=4
 ```
 
-> **Note:** For very large datasets (100GB+), the in-memory approach will not work. Streaming/iterative processing is planned for a future version.
+> **Note:** For very large datasets that don't fit in node RAM, use `--writer stream` (see Resource requirements above).

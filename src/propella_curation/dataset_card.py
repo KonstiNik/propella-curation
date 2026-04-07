@@ -33,6 +33,7 @@ Curated subset of `{source_dataset}`, filtered using
 | Source rows | {source_rows:,} |
 | Selected rows | {selected_rows:,} ({selection_pct:.1f}%) |
 | Seed | {seed} |
+| Writer | {writer} |
 | Date | {date} |
 
 ## Score distribution (after selection)
@@ -65,6 +66,8 @@ class CurationInfo:
     source_rows: int
     selected_rows: int
     scores_after: "numpy.ndarray"  # noqa: F821
+    max_duplications: int | None = None
+    writer: str = "load"
 
 
 def write_dataset_card(info: CurationInfo, output_dir: str) -> None:
@@ -74,12 +77,21 @@ def write_dataset_card(info: CurationInfo, output_dir: str) -> None:
     scores = info.scores_after
     pcts = np.percentile(scores, [10, 25, 50, 75, 90])
 
+    # n_samples is None when the user didn't pass --n_samples; apply() then
+    # defaults it to len(dataset), which equals source_rows.
+    n_display = info.n_samples if info.n_samples is not None else info.source_rows
+
     if info.mode == "threshold":
         mode_description = f"threshold >= {info.threshold}"
     elif info.mode == "sample_without_replacement":
-        mode_description = f"sample without replacement (n={info.n_samples:,})"
+        mode_description = f"sample without replacement (n={n_display:,})"
     else:
-        mode_description = f"sample with replacement (n={info.n_samples:,})"
+        cap = (
+            f", max_duplications={info.max_duplications}"
+            if info.max_duplications is not None
+            else ""
+        )
+        mode_description = f"sample with replacement (n={n_display:,}{cap})"
 
     content = _TEMPLATE.format(
         name=info.name,
@@ -91,6 +103,7 @@ def write_dataset_card(info: CurationInfo, output_dir: str) -> None:
         selected_rows=info.selected_rows,
         selection_pct=info.selected_rows / info.source_rows * 100,
         seed=info.seed,
+        writer=info.writer,
         date=date.today().isoformat(),
         mean=scores.mean(),
         median=np.median(scores),

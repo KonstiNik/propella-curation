@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pytest
 import yaml
 from datasets import Dataset
@@ -369,12 +371,187 @@ class TestSelectProbabilistic:
         n_draws = 100_000
         rng = np.random.default_rng(42)
         indices = ScoreSampler._select_probabilistic(
-            scores, n_draws, replace=True, rng=rng,
+            scores,
+            n_draws,
+            replace=True,
+            rng=rng,
         )
         counts = np.bincount(indices, minlength=len(scores))
         observed_probs = counts / n_draws
         # With 100k draws, observed frequencies should be close to expected
         np.testing.assert_allclose(observed_probs, expected_probs, atol=0.01)
+
+    def test_max_duplications_respected(self):
+        scores = np.array([0.1, 0.5, 0.9, 0.0, 0.7, 0.3])
+        rng = np.random.default_rng(0)
+        indices = ScoreSampler._select_probabilistic(
+            scores,
+            n_samples=200,
+            replace=True,
+            rng=rng,
+            max_duplications=3,
+        )
+        counts = np.bincount(indices, minlength=len(scores))
+        assert counts.max() <= 3
+        # zero-score example never selected
+        assert counts[3] == 0
+
+    def test_max_duplications_caps_infeasible_request(self):
+        scores = np.array([0.1, 0.5, 0.9, 0.0, 0.7])  # 4 nonzero
+        rng = np.random.default_rng(0)
+        indices = ScoreSampler._select_probabilistic(
+            scores,
+            n_samples=100,
+            replace=True,
+            rng=rng,
+            max_duplications=2,
+        )
+        # capacity is 4 nonzero * 2 = 8
+        assert len(indices) == 8
+        counts = np.bincount(indices, minlength=len(scores))
+        assert counts.max() <= 2
+
+    def test_max_duplications_none_matches_uncapped(self):
+        scores = np.array([0.1, 0.5, 0.9, 0.3])
+        rng1 = np.random.default_rng(7)
+        rng2 = np.random.default_rng(7)
+        idx1 = ScoreSampler._select_probabilistic(
+            scores,
+            n_samples=20,
+            replace=True,
+            rng=rng1,
+        )
+        idx2 = ScoreSampler._select_probabilistic(
+            scores,
+            n_samples=20,
+            replace=True,
+            rng=rng2,
+            max_duplications=None,
+        )
+        np.testing.assert_array_equal(idx1, idx2)
+
+    def test_max_duplications_invalid_raises(self):
+        scores = np.array([0.1, 0.5, 0.9])
+        rng = np.random.default_rng(0)
+        with pytest.raises(ValueError, match="max_duplications must be >= 1"):
+            ScoreSampler._select_probabilistic(
+                scores,
+                n_samples=5,
+                replace=True,
+                rng=rng,
+                max_duplications=0,
+            )
+
+    def test_max_duplications_one_equivalent_to_without_replacement(self):
+        scores = np.array([0.1, 0.5, 0.9, 0.0, 0.7, 0.3])
+        rng = np.random.default_rng(0)
+        indices = ScoreSampler._select_probabilistic(
+            scores,
+            n_samples=5,
+            replace=True,
+            rng=rng,
+            max_duplications=1,
+        )
+        # 5 nonzero examples, max_dup=1 → exactly 5 unique indices, no zero-score idx
+        assert len(indices) == 5
+        assert len(set(indices)) == 5
+        assert 3 not in indices
+
+    def test_max_duplications_single_nonzero_score(self):
+        scores = np.array([0.0, 0.0, 0.5, 0.0])
+        rng = np.random.default_rng(0)
+        indices = ScoreSampler._select_probabilistic(
+            scores,
+            n_samples=5,
+            replace=True,
+            rng=rng,
+            max_duplications=2,
+        )
+        # capacity = 1 nonzero × 2 = 2
+        assert len(indices) == 2
+        assert all(i == 2 for i in indices)
+
+    def test_max_duplications_n_samples_zero(self):
+        scores = np.array([0.1, 0.5, 0.9])
+        rng = np.random.default_rng(0)
+        indices = ScoreSampler._select_probabilistic(
+            scores,
+            n_samples=0,
+            replace=True,
+            rng=rng,
+            max_duplications=2,
+        )
+        assert len(indices) == 0
+
+    @pytest.mark.parametrize(
+        "scores,n_samples,max_dup",
+        [
+            # moderate saturation
+            (np.array([0.4, 0.3, 0.2, 0.1]), 6, 2),
+            # near-saturated: capacity=8, n=7 → forces multi-saturation per batch
+            (np.array([0.4, 0.3, 0.2, 0.1]), 7, 2),
+            # skewed weights, near-saturated: capacity=6, n=5
+            (np.array([0.6, 0.2, 0.15, 0.05]), 5, 2),
+        ],
+    )
+    def test_max_duplications_marginals_match_rejection_baseline(
+        self,
+        scores,
+        n_samples,
+        max_dup,
+    ):
+        """Refill loop should produce the same marginal distribution as brute-force rejection sampling."""
+        n_trials = 8000
+
+        def rejection_sample(seed: int) -> np.ndarray:
+            r = np.random.default_rng(seed)
+            probs = scores / scores.sum()
+            counts = np.zeros(len(scores), dtype=np.int64)
+            drawn = 0
+            while drawn < n_samples:
+                i = r.choice(len(scores), p=probs)
+                if counts[i] < max_dup:
+                    counts[i] += 1
+                    drawn += 1
+            return counts
+
+        ref_counts = np.zeros(len(scores))
+        impl_counts = np.zeros(len(scores))
+        for s in range(n_trials):
+            ref_counts += rejection_sample(s)
+            r = np.random.default_rng(s + 100000)
+            idx = ScoreSampler._select_probabilistic(
+                scores,
+                n_samples=n_samples,
+                replace=True,
+                rng=r,
+                max_duplications=max_dup,
+            )
+            impl_counts += np.bincount(idx, minlength=len(scores))
+
+        ref_freq = ref_counts / ref_counts.sum()
+        impl_freq = impl_counts / impl_counts.sum()
+        np.testing.assert_allclose(impl_freq, ref_freq, atol=0.01)
+
+    def test_max_duplications_reproducible_with_seed(self):
+        scores = np.array([0.1, 0.5, 0.9, 0.3, 0.7])
+        rng1 = np.random.default_rng(42)
+        rng2 = np.random.default_rng(42)
+        idx1 = ScoreSampler._select_probabilistic(
+            scores,
+            n_samples=30,
+            replace=True,
+            rng=rng1,
+            max_duplications=4,
+        )
+        idx2 = ScoreSampler._select_probabilistic(
+            scores,
+            n_samples=30,
+            replace=True,
+            rng=rng2,
+            max_duplications=4,
+        )
+        np.testing.assert_array_equal(idx1, idx2)
 
     def test_without_replacement_caps_n_samples(self):
         scores = np.array([0.0, 0.5, 0.0, 0.8])  # only 2 non-zero
@@ -463,7 +640,7 @@ class TestIDMatchValidation:
             ann_path = _write_annotations_parquet(ann_df, tmpdir)
             config = _simple_config()
             sampler = ScoreSampler(config=config)
-            result, _ = sampler.apply(
+            result, _, _ = sampler.apply(
                 ds,
                 ann_path,
                 mode="threshold",
@@ -519,7 +696,7 @@ class TestApplyIntegration:
             ds, ann_path, _ = self._setup(tmpdir)
             config = _simple_config()
             sampler = ScoreSampler(config=config)
-            result, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
+            result, _, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
             assert len(result) < len(ds)
             assert len(result) > 0
             # All remaining IDs should exist in original
@@ -531,7 +708,7 @@ class TestApplyIntegration:
             config = _simple_config()
             sampler = ScoreSampler(config=config)
             n_samples = 20
-            result, _ = sampler.apply(
+            result, _, _ = sampler.apply(
                 ds,
                 ann_path,
                 mode="sample_without_replacement",
@@ -547,7 +724,7 @@ class TestApplyIntegration:
             ds, ann_path, _ = self._setup(tmpdir, n=5)
             config = _simple_config()
             sampler = ScoreSampler(config=config)
-            result, _ = sampler.apply(
+            result, _, _ = sampler.apply(
                 ds,
                 ann_path,
                 mode="sample_with_replacement",
@@ -558,12 +735,108 @@ class TestApplyIntegration:
             # With 50 samples from 5 examples, must have duplicates
             assert len(set(result["id"])) < 50
 
+    def test_sample_with_replacement_max_duplications(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ds, ann_path, _ = self._setup(tmpdir, n=10)
+            config = _simple_config()
+            sampler = ScoreSampler(config=config)
+            result, _, _ = sampler.apply(
+                ds,
+                ann_path,
+                mode="sample_with_replacement",
+                n_samples=100,
+                seed=42,
+                max_duplications=3,
+            )
+            from collections import Counter
+
+            counts = Counter(result["id"])
+            assert max(counts.values()) <= 3
+
+    def test_max_duplications_rejected_for_non_replacement_modes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ds, ann_path, _ = self._setup(tmpdir, n=10)
+            sampler = ScoreSampler(config=_simple_config())
+            with pytest.raises(ValueError, match="max_duplications is only valid"):
+                sampler.apply(
+                    ds,
+                    ann_path,
+                    mode="threshold",
+                    threshold=0.5,
+                    max_duplications=3,
+                )
+            with pytest.raises(ValueError, match="max_duplications is only valid"):
+                sampler.apply(
+                    ds,
+                    ann_path,
+                    mode="sample_without_replacement",
+                    n_samples=5,
+                    max_duplications=3,
+                )
+
+    def test_dataset_card_writes_with_none_n_samples(self):
+        """Regression: writing a card with n_samples=None must not raise."""
+        from propella_curation.dataset_card import CurationInfo, write_dataset_card
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            info = CurationInfo(
+                name="x",
+                source_dataset="src",
+                annotations_path="ann",
+                config_name="default",
+                mode="sample_with_replacement",
+                threshold=None,
+                n_samples=None,  # user didn't pass --n_samples
+                seed=0,
+                source_rows=100,
+                selected_rows=100,
+                scores_after=np.array([0.1, 0.5, 0.9]),
+                max_duplications=3,
+            )
+            write_dataset_card(info, tmpdir)
+            content = (Path(tmpdir) / "README.md").read_text()
+            assert "n=100" in content  # falls back to source_rows
+            assert "max_duplications=3" in content
+
+    def test_curation_info_constructs_with_max_duplications(self):
+        from propella_curation.dataset_card import CurationInfo
+
+        info = CurationInfo(
+            name="x",
+            source_dataset="src",
+            annotations_path="ann",
+            config_name="default",
+            mode="sample_with_replacement",
+            threshold=None,
+            n_samples=10,
+            seed=0,
+            source_rows=100,
+            selected_rows=10,
+            scores_after=np.array([0.1, 0.5, 0.9]),
+            max_duplications=3,
+        )
+        assert info.max_duplications == 3
+        info2 = CurationInfo(
+            name="x",
+            source_dataset="src",
+            annotations_path="ann",
+            config_name="default",
+            mode="threshold",
+            threshold=0.5,
+            n_samples=None,
+            seed=0,
+            source_rows=100,
+            selected_rows=10,
+            scores_after=np.array([0.1, 0.5, 0.9]),
+        )
+        assert info2.max_duplications is None
+
     def test_propella_all_config(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             ds, ann_path, _ = self._setup(tmpdir)
             config = ScoringConfig.from_name("propella_all")
             sampler = ScoreSampler(config=config)
-            result, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
+            result, _, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
             assert len(result) <= len(ds)
 
     def test_custom_yaml_config(self):
@@ -607,7 +880,7 @@ class TestApplyIntegration:
 
             config = ScoringConfig.from_file(config_path)
             sampler = ScoreSampler(config=config)
-            result, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
+            result, _, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.5)
             assert len(result) <= len(ds)
 
     def test_output_preserves_columns(self):
@@ -615,7 +888,7 @@ class TestApplyIntegration:
             ds, ann_path, _ = self._setup(tmpdir)
             config = _simple_config()
             sampler = ScoreSampler(config=config)
-            result, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.0)
+            result, _, _ = sampler.apply(ds, ann_path, mode="threshold", threshold=0.0)
             assert result.column_names == ds.column_names
 
     def test_seed_reproducibility(self):
@@ -623,14 +896,14 @@ class TestApplyIntegration:
             ds, ann_path, _ = self._setup(tmpdir)
             config = _simple_config()
             sampler = ScoreSampler(config=config)
-            r1, _ = sampler.apply(
+            r1, _, _ = sampler.apply(
                 ds,
                 ann_path,
                 mode="sample_without_replacement",
                 n_samples=10,
                 seed=99,
             )
-            r2, _ = sampler.apply(
+            r2, _, _ = sampler.apply(
                 ds,
                 ann_path,
                 mode="sample_without_replacement",
@@ -638,3 +911,187 @@ class TestApplyIntegration:
                 seed=99,
             )
             assert r1["id"] == r2["id"]
+
+
+# ============================================================
+# Integration tests — full CLI writer (load + stream)
+# ============================================================
+
+
+class TestWriterCLI:
+    """Run the full CLI end-to-end against on-disk parquet for both writer modes.
+
+    This is the only test that exercises the per-source-chunk writer with a
+    real chunked parquet source. Catches any divergence between the load and
+    stream paths and verifies max_duplications round-trips through to disk.
+    """
+
+    def _make_source_parquets(
+        self, tmpdir: str, n_files: int = 3, rows_per_file: int = 40
+    ) -> str:
+        """Write a multi-shard source dataset with a nested messages column."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        data_dir = os.path.join(tmpdir, "source", "data")
+        os.makedirs(data_dir)
+        for f in range(n_files):
+            start = f * rows_per_file
+            ids = [f"d{start + i:04d}" for i in range(rows_per_file)]
+            messages = [
+                [
+                    {"role": "user", "content": f"q{start + i}"},
+                    {"role": "assistant", "content": f"a{start + i}"},
+                ]
+                for i in range(rows_per_file)
+            ]
+            table = pa.table({"id": ids, "messages": messages})
+            pq.write_table(table, os.path.join(data_dir, f"train-{f:05d}.parquet"))
+        return os.path.join(tmpdir, "source")
+
+    def _run_cli(self, src_dir: str, ann_path: str, out_dir: str, writer: str) -> None:
+        from propella_curation.score_sampler import main
+
+        argv = [
+            "propella-score-sampler",
+            "--dataset_path",
+            src_dir,
+            "--annotations_path",
+            ann_path,
+            "--output_dir",
+            out_dir,
+            "--mode",
+            "sample_with_replacement",
+            "--n_samples",
+            "200",
+            "--max_duplications",
+            "3",
+            "--seed",
+            "7",
+            "--writer",
+            writer,
+        ]
+        old_argv = sys.argv
+        sys.argv = argv
+        try:
+            main()
+        finally:
+            sys.argv = old_argv
+
+    def _read_output_ids(self, out_dir: str) -> list[str]:
+        import glob
+
+        import pyarrow.parquet as pq
+
+        files = sorted(glob.glob(os.path.join(out_dir, "data", "*.parquet")))
+        ids: list[str] = []
+        for f in files:
+            ids.extend(pq.read_table(f, columns=["id"])["id"].to_pylist())
+        return ids
+
+    def test_load_and_stream_produce_same_multiset(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_dir = self._make_source_parquets(tmpdir, n_files=3, rows_per_file=40)
+            ids = [f"d{i:04d}" for i in range(120)]
+            ann_df = _make_annotations_df(
+                ids=ids,
+                quality=["excellent"] * 60 + ["good"] * 40 + ["poor"] * 20,
+            )
+            ann_path = os.path.join(tmpdir, "ann.parquet")
+            ann_df.to_parquet(ann_path)
+
+            load_dir = os.path.join(tmpdir, "out_load")
+            stream_dir = os.path.join(tmpdir, "out_stream")
+            self._run_cli(src_dir, ann_path, load_dir, "load")
+            self._run_cli(src_dir, ann_path, stream_dir, "stream")
+
+            load_ids = self._read_output_ids(load_dir)
+            stream_ids = self._read_output_ids(stream_dir)
+
+            # Same row count
+            assert len(load_ids) == len(stream_ids) == 200
+
+            # Same multiset of rows (different ordering is allowed)
+            from collections import Counter
+
+            assert Counter(load_ids) == Counter(stream_ids)
+
+            # max_duplications respected
+            assert max(Counter(load_ids).values()) <= 3
+            assert max(Counter(stream_ids).values()) <= 3
+
+            # 'load' preserves sampler order; 'stream' sorts by source row.
+            # IDs are zero-padded so lex order == source order, making the
+            # sortedness check meaningful here.
+            assert stream_ids == sorted(stream_ids)
+            assert load_ids != sorted(load_ids)  # extremely unlikely to be sorted
+
+            # Output schema must equal source schema (no silent type drift).
+            import glob
+            import pyarrow.parquet as pq
+            src_schema = pq.read_schema(
+                sorted(glob.glob(os.path.join(src_dir, "data", "*.parquet")))[0]
+            )
+            for out_dir in (load_dir, stream_dir):
+                for f in sorted(glob.glob(os.path.join(out_dir, "data", "*.parquet"))):
+                    assert pq.read_schema(f).equals(src_schema, check_metadata=False)
+
+    def test_apply_returns_source_table_indices_after_select(self):
+        """If the input dataset already has an indices mapping, apply()'s
+        returned indices must reference dataset.data.table directly (composed),
+        so a caller can take from data.table without further composition."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ds, ann_path, _ = self._setup_ds_with_annotations(tmpdir)
+            shuffled = ds.shuffle(seed=11)  # creates an _indices mapping
+            assert shuffled._indices is not None
+
+            sampler = ScoreSampler(config=_simple_config())
+            filtered, _, gather = sampler.apply(
+                shuffled,
+                ann_path,
+                mode="sample_with_replacement",
+                n_samples=20,
+                seed=3,
+                max_duplications=2,
+            )
+            # gather should index into shuffled.data.table directly
+            taken = shuffled.data.table.take(pa.array(gather)).column("id").to_pylist()
+            assert taken == filtered["id"]
+
+    def test_load_and_stream_match_with_shuffled_input(self):
+        """Same as the main multiset test but the source dataset is shuffled
+        first via the CLI's normal load path. This exercises the dataset_card
+        write step too."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_dir = self._make_source_parquets(tmpdir, n_files=4, rows_per_file=30)
+            ids = [f"d{i:04d}" for i in range(120)]
+            ann_df = _make_annotations_df(
+                ids=ids,
+                quality=["excellent"] * 80 + ["good"] * 30 + ["poor"] * 10,
+            )
+            ann_path = os.path.join(tmpdir, "ann.parquet")
+            ann_df.to_parquet(ann_path)
+
+            load_dir = os.path.join(tmpdir, "out_load")
+            stream_dir = os.path.join(tmpdir, "out_stream")
+            self._run_cli(src_dir, ann_path, load_dir, "load")
+            self._run_cli(src_dir, ann_path, stream_dir, "stream")
+
+            load_ids = self._read_output_ids(load_dir)
+            stream_ids = self._read_output_ids(stream_dir)
+            from collections import Counter
+            assert Counter(load_ids) == Counter(stream_ids)
+
+    def _setup_ds_with_annotations(self, tmpdir: str):
+        src_dir = self._make_source_parquets(tmpdir, n_files=3, rows_per_file=20)
+        from datasets import load_dataset
+        import glob as _g
+        files = sorted(_g.glob(os.path.join(src_dir, "data", "*.parquet")))
+        ds = load_dataset("parquet", data_files=files, split="train")
+        ann_df = _make_annotations_df(
+            ids=ds["id"],
+            quality=["excellent"] * len(ds),
+        )
+        ann_path = os.path.join(tmpdir, "ann.parquet")
+        ann_df.to_parquet(ann_path)
+        return ds, ann_path, ann_df
