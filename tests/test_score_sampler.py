@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import glob
 import os
 import sys
 import tempfile
@@ -1026,8 +1027,30 @@ class TestWriterCLI:
             assert stream_ids == sorted(stream_ids)
             assert load_ids != sorted(load_ids)  # extremely unlikely to be sorted
 
+            # 'load' must preserve the *exact* sampler draw order, not just
+            # be unsorted. We reconstruct the expected order by re-running
+            # the sampler with the same seed (and same config the CLI uses
+            # by default) and checking that the output rows match position
+            # by position.
+            sampler = ScoreSampler(config=DEFAULT_SCORING_CONFIG)
+            from datasets import load_dataset as _ld
+            src_ds = _ld(
+                "parquet",
+                data_files=sorted(glob.glob(os.path.join(src_dir, "data", "*.parquet"))),
+                split="train",
+            )
+            _, _, expected_indices = sampler.apply(
+                src_ds,
+                ann_path,
+                mode="sample_with_replacement",
+                n_samples=200,
+                seed=7,
+                max_duplications=3,
+            )
+            expected_ids = [src_ds["id"][int(i)] for i in expected_indices]
+            assert load_ids == expected_ids
+
             # Output schema must equal source schema (no silent type drift).
-            import glob
             import pyarrow.parquet as pq
             src_schema = pq.read_schema(
                 sorted(glob.glob(os.path.join(src_dir, "data", "*.parquet")))[0]
@@ -1057,6 +1080,31 @@ class TestWriterCLI:
             # gather should index into shuffled.data.table directly
             taken = shuffled.data.table.take(pa.array(gather)).column("id").to_pylist()
             assert taken == filtered["id"]
+
+    def test_empty_selection_writes_empty_shard(self):
+        """Threshold mode that filters out everything must still produce a
+        valid (empty) HF dataset layout, not crash on parts[0]."""
+        from propella_curation.score_sampler import _write_sharded_parquet
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_dir = self._make_source_parquets(tmpdir, n_files=2, rows_per_file=10)
+            files = sorted(glob.glob(os.path.join(src_dir, "data", "*.parquet")))
+            import pyarrow.parquet as pq
+            src_chunks = [pq.read_table(f) for f in files]
+            out_dir = os.path.join(tmpdir, "out")
+            os.makedirs(out_dir)
+            n = _write_sharded_parquet(
+                src_chunks,
+                np.array([], dtype=np.int64),
+                rows_per_shard=5,
+                output_dir=out_dir,
+                sort_for_locality=False,
+            )
+            assert n == 1
+            written = sorted(glob.glob(os.path.join(out_dir, "*.parquet")))
+            assert len(written) == 1
+            tbl = pq.read_table(written[0])
+            assert len(tbl) == 0
+            assert tbl.schema.equals(src_chunks[0].schema, check_metadata=False)
 
     def test_load_and_stream_match_with_shuffled_input(self):
         """Same as the main multiset test but the source dataset is shuffled

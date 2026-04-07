@@ -515,16 +515,53 @@ def _write_sharded_parquet(
 
     n_total = len(gather_indices)
     n_shards = max(1, (n_total + rows_per_shard - 1) // rows_per_shard)
+
+    # Empty input: still write a single empty shard with the source schema so
+    # downstream consumers see a valid (empty) HF dataset layout.
+    if n_total == 0:
+        empty = src_chunks[0].slice(0, 0) if src_chunks else None
+        if empty is not None:
+            shard_path = os.path.join(output_dir, "train-00000-of-00001.parquet")
+            pq.write_table(empty, shard_path, use_dictionary=True, compression="snappy")
+            print(f"  wrote shard 1/1 (0 rows)")
+        return 1
+
     for i in range(n_shards):
         start = i * rows_per_shard
         end = min((i + 1) * rows_per_shard, n_total)
         shard_chunk_ids = chunk_ids_all[start:end]
         shard_local = local_idx_all[start:end]
+
+        # Group rows by source chunk so each take() hits a single chunk (avoids
+        # the chunked-array concat that overflows 32-bit string offsets), then
+        # restore the original within-shard order via an inverse permutation.
+        # When sort_for_locality=True the indices were globally sorted upstream,
+        # so chunk grouping is already in order and the inverse permutation is
+        # the identity — but it's cheap and keeps both paths uniform.
+        grouped_order = np.argsort(shard_chunk_ids, kind="stable")
+        grouped_chunk_ids = shard_chunk_ids[grouped_order]
+        grouped_local = shard_local[grouped_order]
+
         parts = []
-        for ci in np.unique(shard_chunk_ids):
-            mask = shard_chunk_ids == ci
-            parts.append(src_chunks[ci].take(pa.array(shard_local[mask])))
-        shard = pa.concat_tables(parts) if len(parts) > 1 else parts[0]
+        run_starts = np.flatnonzero(
+            np.r_[True, grouped_chunk_ids[1:] != grouped_chunk_ids[:-1]]
+        )
+        run_ends = np.r_[run_starts[1:], len(grouped_chunk_ids)]
+        for run_start, run_end in zip(run_starts, run_ends):
+            ci = int(grouped_chunk_ids[run_start])
+            parts.append(
+                src_chunks[ci].take(pa.array(grouped_local[run_start:run_end]))
+            )
+        shard_grouped = pa.concat_tables(parts) if len(parts) > 1 else parts[0]
+
+        if sort_for_locality:
+            # grouped_order is monotonic in this case; skip the inverse take.
+            shard = shard_grouped
+        else:
+            inverse_order = np.empty(len(grouped_order), dtype=np.int64)
+            inverse_order[grouped_order] = np.arange(len(grouped_order), dtype=np.int64)
+            shard = shard_grouped.take(pa.array(inverse_order))
+
         shard_path = os.path.join(
             output_dir, f"train-{i:05d}-of-{n_shards:05d}.parquet"
         )
@@ -603,7 +640,7 @@ def main() -> None:
         help="Cap on how many times any single example may be drawn "
         "(only used with --mode sample_with_replacement). Default: no cap. "
         "If --n_samples exceeds max_duplications × (number of examples with score > 0), "
-        "n_samples is silently capped to that capacity.",
+        "n_samples is capped to that capacity and a warning is printed.",
     )
     optional.add_argument(
         "--seed",
