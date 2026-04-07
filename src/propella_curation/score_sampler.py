@@ -17,7 +17,11 @@ Usage (CLI):
 Usage (library):
     from propella_curation import ScoreSampler
     sampler = ScoreSampler()
-    filtered, scores = sampler.apply(dataset, "annotations.parquet", mode="threshold", threshold=0.7)
+    filtered, scores, indices = sampler.apply(
+        dataset, "annotations.parquet", mode="threshold", threshold=0.7
+    )
+    # `indices` are int64 source-table positions; for sample_with_replacement
+    # they may contain duplicates.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from typing import Dict, Literal, Optional
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 from datasets import Dataset, load_dataset
@@ -185,6 +190,7 @@ class ScoreSampler:
         n_samples: int,
         replace: bool,
         rng: np.random.Generator,
+        max_duplications: Optional[int] = None,
     ) -> np.ndarray:
         probs = scores.copy()
         probs[probs < 0] = 0.0
@@ -195,13 +201,65 @@ class ScoreSampler:
                 "Lower the threshold or adjust the scoring config."
             )
         probs = probs / total
-        if not replace and n_samples > (probs > 0).sum():
-            n_samples = int((probs > 0).sum())
+        nonzero = int((probs > 0).sum())
+
+        if not replace:
+            if n_samples > nonzero:
+                n_samples = nonzero
+                print(
+                    f"  Warning: n_samples capped to {n_samples} "
+                    f"(number of examples with score > 0) for sampling without replacement"
+                )
+            return rng.choice(len(scores), size=n_samples, replace=False, p=probs)
+
+        # replace=True
+        if max_duplications is None:
+            return rng.choice(len(scores), size=n_samples, replace=True, p=probs)
+
+        if max_duplications < 1:
+            raise ValueError("max_duplications must be >= 1")
+
+        capacity = max_duplications * nonzero
+        if n_samples > capacity:
             print(
-                f"  Warning: n_samples capped to {n_samples} "
-                f"(number of examples with score > 0) for sampling without replacement"
+                f"  Warning: n_samples capped to {capacity} "
+                f"(max_duplications={max_duplications} × {nonzero} eligible examples)"
             )
-        return rng.choice(len(scores), size=n_samples, replace=replace, p=probs)
+            n_samples = capacity
+
+        # Iterative refill: draw with replacement, clamp any item that exceeds
+        # the cap, then re-draw the excess from a renormalized distribution that
+        # excludes saturated items. This produces the same distribution as
+        # rejection sampling ("draw, redraw if the chosen item is already at
+        # cap"): once an item is saturated, conditioning on it not being drawn
+        # is equivalent to setting its probability to zero, and zeroing
+        # preserves the relative weights of the remaining items.
+        counts = np.zeros(len(scores), dtype=np.int64)
+        remaining = n_samples
+        cur_probs = probs.copy()
+
+        while remaining > 0:
+            draw = rng.choice(len(scores), size=remaining, replace=True, p=cur_probs)
+            np.add.at(counts, draw, 1)
+            over = counts > max_duplications
+            if not over.any():
+                break
+            excess = int((counts[over] - max_duplications).sum())
+            counts[over] = max_duplications
+            cur_probs[counts >= max_duplications] = 0.0
+            s = cur_probs.sum()
+            if s == 0:
+                # Unreachable: the capacity check above guarantees we never
+                # exhaust the eligible pool before hitting n_samples.
+                raise AssertionError(
+                    "refill loop exhausted eligible pool — capacity check is broken"
+                )
+            cur_probs = cur_probs / s
+            remaining = excess
+
+        indices = np.repeat(np.arange(len(scores)), counts)
+        rng.shuffle(indices)
+        return indices
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -218,10 +276,29 @@ class ScoreSampler:
         n_samples: Optional[int] = None,
         seed: int = 42,
         force: bool = False,
-    ) -> tuple[Dataset, np.ndarray]:
-        """Apply score-based selection and return (filtered Dataset, selected scores)."""
+        max_duplications: Optional[int] = None,
+    ) -> tuple[Dataset, np.ndarray, np.ndarray]:
+        """Apply score-based selection.
+
+        Returns ``(filtered_dataset, selected_scores, indices)`` where ``indices``
+        is the int64 array of **source-table** row positions used to build the
+        filtered dataset (may contain duplicates for ``sample_with_replacement``).
+        If ``dataset`` has its own indices mapping (e.g. it was already
+        ``select``-ed), those mappings are composed away — the returned indices
+        always reference ``dataset.data.table`` directly, so a caller can do
+        ``dataset.data.table.take(indices)`` and get the right rows.
+
+        ``max_duplications`` is only meaningful with ``mode='sample_with_replacement'``;
+        passing it with any other mode raises ValueError.
+        """
         print("Score Sampler")
         print("=" * 50)
+
+        if max_duplications is not None and mode != "sample_with_replacement":
+            raise ValueError(
+                f"max_duplications is only valid with mode='sample_with_replacement', "
+                f"got mode='{mode}'"
+            )
 
         # 1. Load annotations & compute scores
         ann_df = self.load_annotations(annotations_path)
@@ -269,8 +346,17 @@ class ScoreSampler:
         elif mode == "sample_with_replacement":
             n = n_samples if n_samples is not None else len(dataset)
             rng = np.random.default_rng(seed)
-            indices = self._select_probabilistic(scores, n, replace=True, rng=rng)
-            print(f"\n  Mode: sample with replacement (n={n:,}, seed={seed})")
+            indices = self._select_probabilistic(
+                scores,
+                n,
+                replace=True,
+                rng=rng,
+                max_duplications=max_duplications,
+            )
+            cap_str = (
+                f", max_dup={max_duplications}" if max_duplications is not None else ""
+            )
+            print(f"\n  Mode: sample with replacement (n={n:,}, seed={seed}{cap_str})")
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -281,7 +367,17 @@ class ScoreSampler:
         self._print_score_distribution(scores[indices], label="after selection")
         print("=" * 50)
 
-        return dataset.select(indices), scores[indices]
+        indices_i64 = np.asarray(indices, dtype=np.int64)
+        # Compose any existing indices mapping into source-table coordinates so
+        # the returned indices array is always directly take-able from
+        # dataset.data.table — without this, the returned Dataset and the
+        # returned indices reference different coordinate systems.
+        if dataset._indices is not None:
+            base = dataset._indices.column(0).to_numpy().astype(np.int64)
+            source_indices = base[indices_i64]
+        else:
+            source_indices = indices_i64
+        return dataset.select(indices_i64), scores[indices_i64], source_indices
 
     # ------------------------------------------------------------------
     # Logging
@@ -300,6 +396,178 @@ class ScoreSampler:
             f"    p10={pcts[0]:.3f}  p25={pcts[1]:.3f}  p50={pcts[2]:.3f}  "
             f"p75={pcts[3]:.3f}  p90={pcts[4]:.3f}"
         )
+
+
+# ============================================================
+# WRITER HELPERS
+# ============================================================
+
+
+def _load_chunks_in_memory(source_files: list[str]) -> list["pa.Table"]:
+    """Fully decode each source parquet into an in-RAM single-chunk Arrow Table.
+
+    Random access is then a pure memory operation, so the writer can preserve
+    the sampler's draw order without per-shard random parquet decoding.
+    """
+    return [pq.read_table(p) for p in source_files]
+
+
+def _load_chunks_mmap(dataset: Dataset) -> list["pa.Table"]:
+    """Wrap each row-aligned batch of an mmap'd HF Dataset as its own Table.
+
+    Uses ``Table.to_batches()`` which yields ``RecordBatch`` objects covering
+    uniform row ranges across all columns, regardless of how the underlying
+    columns are chunked. This sidesteps the need to validate chunk alignment
+    and avoids ``combine_chunks`` (which would overflow 32-bit string offsets
+    on large nested columns).
+
+    No copies — the resulting tables share the underlying mmap'd buffers.
+    """
+    return [pa.Table.from_batches([batch]) for batch in dataset.data.table.to_batches()]
+
+
+def _estimate_decoded_size_bytes(source_files: list[str]) -> int:
+    """Cheap estimate of decoded source size by reading parquet metadata only.
+
+    Sums each file's uncompressed total byte size from row-group metadata.
+    No decoding, so this is fast (~ms per file). The estimate is approximate
+    because parquet's recorded uncompressed size doesn't account for Arrow's
+    in-memory layout overhead, but it's good enough for a soft warning.
+    """
+    total = 0
+    for p in source_files:
+        meta = pq.ParquetFile(p).metadata
+        for rg in range(meta.num_row_groups):
+            total += meta.row_group(rg).total_byte_size
+    return total
+
+
+def _available_memory_bytes() -> Optional[int]:
+    """Best-effort detection of available RAM, preferring SLURM cgroup limit.
+
+    Returns None if we can't tell. SLURM_MEM_PER_NODE is documented as MB but
+    may carry a unit suffix (K/M/G/T) depending on cluster config.
+    """
+    slurm_mem = os.environ.get("SLURM_MEM_PER_NODE")
+    if slurm_mem:
+        try:
+            s = slurm_mem.strip().upper()
+            unit = 1024 * 1024  # default: MB
+            if s.endswith(("K", "KB")):
+                s, unit = s.rstrip("KB"), 1024
+            elif s.endswith(("M", "MB")):
+                s, unit = s.rstrip("MB"), 1024 * 1024
+            elif s.endswith(("G", "GB")):
+                s, unit = s.rstrip("GB"), 1024 * 1024 * 1024
+            elif s.endswith(("T", "TB")):
+                s, unit = s.rstrip("TB"), 1024 * 1024 * 1024 * 1024
+            return int(float(s) * unit)
+        except (ValueError, TypeError):
+            pass
+    try:
+        import psutil  # type: ignore
+
+        return psutil.virtual_memory().available
+    except Exception:
+        return None
+
+
+def _write_sharded_parquet(
+    src_chunks: list["pa.Table"],
+    gather_indices: np.ndarray,
+    rows_per_shard: int,
+    output_dir: str,
+    *,
+    sort_for_locality: bool,
+) -> int:
+    """Write a sharded parquet output by gathering rows from per-chunk tables.
+
+    Each gather index points into the logical concatenation of ``src_chunks``.
+    Per shard we group indices by source chunk and call ``Table.take`` once
+    per chunk, then concat the small per-chunk results. This avoids both
+    HF's row-by-row materialization and pyarrow's chunked-array concat (which
+    overflows 32-bit string offsets on large nested columns).
+
+    If ``sort_for_locality`` is True, gather_indices is sorted globally so
+    each shard touches contiguous source rows — required for the streaming
+    (mmap'd) writer to avoid decoding parquet pages randomly. Otherwise the
+    indices are written in the order ScoreSampler produced them (which for
+    sample_with_replacement is itself the post-shuffle output of the refill
+    loop, not literal rng.choice draw order).
+    """
+    if sort_for_locality:
+        gather_indices = np.sort(gather_indices)
+    else:
+        gather_indices = np.asarray(gather_indices, dtype=np.int64)
+
+    chunk_lens = [len(c) for c in src_chunks]
+    total_rows = int(np.sum(chunk_lens))
+    if len(gather_indices) and (
+        gather_indices.min() < 0 or gather_indices.max() >= total_rows
+    ):
+        raise IndexError(
+            f"gather index out of range: min={gather_indices.min()}, "
+            f"max={gather_indices.max()}, source rows={total_rows}"
+        )
+    chunk_offsets = np.concatenate([[0], np.cumsum(chunk_lens)]).astype(np.int64)
+    chunk_ids_all = np.searchsorted(chunk_offsets[1:], gather_indices, side="right")
+    local_idx_all = gather_indices - chunk_offsets[chunk_ids_all]
+
+    n_total = len(gather_indices)
+    n_shards = max(1, (n_total + rows_per_shard - 1) // rows_per_shard)
+
+    # Empty input: still write a single empty shard with the source schema so
+    # downstream consumers see a valid (empty) HF dataset layout.
+    if n_total == 0:
+        empty = src_chunks[0].slice(0, 0) if src_chunks else None
+        if empty is not None:
+            shard_path = os.path.join(output_dir, "train-00000-of-00001.parquet")
+            pq.write_table(empty, shard_path, use_dictionary=True, compression="snappy")
+            print(f"  wrote shard 1/1 (0 rows)")
+        return 1
+
+    for i in range(n_shards):
+        start = i * rows_per_shard
+        end = min((i + 1) * rows_per_shard, n_total)
+        shard_chunk_ids = chunk_ids_all[start:end]
+        shard_local = local_idx_all[start:end]
+
+        # Group rows by source chunk so each take() hits a single chunk (avoids
+        # the chunked-array concat that overflows 32-bit string offsets), then
+        # restore the original within-shard order via an inverse permutation.
+        # When sort_for_locality=True the indices were globally sorted upstream,
+        # so chunk grouping is already in order and the inverse permutation is
+        # the identity — but it's cheap and keeps both paths uniform.
+        grouped_order = np.argsort(shard_chunk_ids, kind="stable")
+        grouped_chunk_ids = shard_chunk_ids[grouped_order]
+        grouped_local = shard_local[grouped_order]
+
+        parts = []
+        run_starts = np.flatnonzero(
+            np.r_[True, grouped_chunk_ids[1:] != grouped_chunk_ids[:-1]]
+        )
+        run_ends = np.r_[run_starts[1:], len(grouped_chunk_ids)]
+        for run_start, run_end in zip(run_starts, run_ends):
+            ci = int(grouped_chunk_ids[run_start])
+            parts.append(
+                src_chunks[ci].take(pa.array(grouped_local[run_start:run_end]))
+            )
+        shard_grouped = pa.concat_tables(parts) if len(parts) > 1 else parts[0]
+
+        if sort_for_locality:
+            # grouped_order is monotonic in this case; skip the inverse take.
+            shard = shard_grouped
+        else:
+            inverse_order = np.empty(len(grouped_order), dtype=np.int64)
+            inverse_order[grouped_order] = np.arange(len(grouped_order), dtype=np.int64)
+            shard = shard_grouped.take(pa.array(inverse_order))
+
+        shard_path = os.path.join(
+            output_dir, f"train-{i:05d}-of-{n_shards:05d}.parquet"
+        )
+        pq.write_table(shard, shard_path, use_dictionary=True, compression="snappy")
+        print(f"  wrote shard {i + 1}/{n_shards} ({len(shard):,} rows)")
+    return n_shards
 
 
 # ============================================================
@@ -366,6 +634,15 @@ def main() -> None:
         "'sample_with_replacement' to oversample.",
     )
     optional.add_argument(
+        "--max_duplications",
+        type=int,
+        default=None,
+        help="Cap on how many times any single example may be drawn "
+        "(only used with --mode sample_with_replacement). Default: no cap. "
+        "If --n_samples exceeds max_duplications × (number of examples with score > 0), "
+        "n_samples is capped to that capacity and a warning is printed.",
+    )
+    optional.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -376,10 +653,22 @@ def main() -> None:
         action="store_true",
         help="Continue even if less than 20%% of dataset IDs have annotations.",
     )
+    optional.add_argument(
+        "--writer",
+        choices=["load", "stream"],
+        default="load",
+        help="How to access the source dataset when writing shards. "
+        "'load' (default): fully decode every source parquet into RAM, then "
+        "write shards in the sampler's draw order. Fast and order-preserving, "
+        "but peak RAM ≈ decoded source size. "
+        "'stream': access source parquets via mmap and gather chunkwise. Peak "
+        "RAM ≈ one shard, but output rows are reordered (sorted by source row "
+        "position) — use this for sources that don't fit in node RAM.",
+    )
 
     args = parser.parse_args()
 
-    print(f"propella-score-sampler")
+    print("propella-score-sampler")
     print(f"  Dataset:     {args.dataset_path}")
     print(f"  Annotations: {args.annotations_path}")
     print(f"  Output:      {args.output_dir}")
@@ -411,14 +700,14 @@ def main() -> None:
         ds = load_dataset(args.dataset_path, split=args.dataset_split)
     print(f"Loaded dataset: {len(ds):,} rows, columns: {ds.column_names}")
 
-    # Estimate rows per shard from source parquet files
-    if source_files:
-        rows_per_shard = len(ds) // len(source_files)
-    else:
-        rows_per_shard = len(ds)
+    # Pick a per-shard row count that mirrors the source layout (same shard
+    # count as input when not over- or undersampling). Floor to 1 so tiny
+    # outputs (e.g. heavy threshold filtering) don't divide to 0.
+    n_source_files = max(1, len(source_files)) if source_files else 1
+    rows_per_shard = max(1, len(ds) // n_source_files)
 
     sampler = ScoreSampler(config=config)
-    filtered, scores_after = sampler.apply(
+    filtered, scores_after, gather_indices = sampler.apply(
         ds,
         annotations_path=args.annotations_path,
         mode=args.mode,
@@ -426,18 +715,61 @@ def main() -> None:
         n_samples=args.n_samples,
         seed=args.seed,
         force=args.force,
+        max_duplications=args.max_duplications,
     )
 
+    # `gather_indices` from apply() is already in source-table coordinates.
     data_dir = os.path.join(args.output_dir, "data")
     os.makedirs(data_dir, exist_ok=True)
-    table = filtered.data.table
-    n_shards = max(1, (len(filtered) + rows_per_shard - 1) // rows_per_shard)
-    for i in range(n_shards):
-        start = i * rows_per_shard
-        end = min((i + 1) * rows_per_shard, len(filtered))
-        shard = table.slice(start, end - start)
-        shard_path = os.path.join(data_dir, f"train-{i:05d}-of-{n_shards:05d}.parquet")
-        pq.write_table(shard, shard_path, use_dictionary=True, compression="snappy")
+
+    # Load source chunks according to the chosen writer mode.
+    if args.writer == "load":
+        if source_files:
+            est = _estimate_decoded_size_bytes(source_files)
+            avail = _available_memory_bytes()
+            if avail is not None and est > 0.8 * avail:
+                print(
+                    f"\n  Warning: estimated decoded source size "
+                    f"~{est / 1e9:.1f} GB exceeds 80% of available memory "
+                    f"(~{avail / 1e9:.1f} GB). The 'load' writer may OOM. "
+                    f"Consider --writer stream (lower RAM, but output rows "
+                    f"are reordered)."
+                )
+            print(f"\nLoading {len(source_files)} source parquet(s) into memory ...")
+            try:
+                src_chunks = _load_chunks_in_memory(source_files)
+            except MemoryError as e:
+                raise MemoryError(
+                    f"Failed to load source dataset into memory "
+                    f"(estimated decoded size ~{est / 1e9:.1f} GB).\n"
+                    f"Re-run with --writer stream to process the dataset "
+                    f"chunkwise:\n"
+                    f"  - Lower peak memory (~one shard at a time)\n"
+                    f"  - Output rows will be reordered (sorted by source row "
+                    f"position) rather than preserved in sampler draw order."
+                ) from e
+        else:
+            # HF-hub-loaded datasets don't expose stable source files we can
+            # re-decode with pq.read_table. Falling through to mmap chunks
+            # would silently change semantics (no order preservation, no
+            # eager load), so we error out instead.
+            raise NotImplementedError(
+                "--writer load is only supported for local parquet datasets. "
+                "Re-run with --writer stream, or download the dataset to a "
+                "local parquet directory and pass that as --dataset_path."
+            )
+        sort_for_locality = False
+    else:  # args.writer == "stream"
+        src_chunks = _load_chunks_mmap(ds)
+        sort_for_locality = True
+
+    n_shards = _write_sharded_parquet(
+        src_chunks,
+        gather_indices,
+        rows_per_shard,
+        data_dir,
+        sort_for_locality=sort_for_locality,
+    )
 
     ratio = len(filtered) / len(ds)
     print(f"\nSaved {len(filtered):,} examples to {data_dir}/ ({n_shards} shards)")
@@ -458,6 +790,8 @@ def main() -> None:
         source_rows=len(ds),
         selected_rows=len(filtered),
         scores_after=scores_after,
+        max_duplications=args.max_duplications,
+        writer=args.writer,
     )
     write_dataset_card(card_info, args.output_dir)
     print(f"  Dataset card written to {args.output_dir}/README.md")
