@@ -331,6 +331,62 @@ class TestSelectThreshold:
         assert len(indices) == 0
 
 
+class TestTemperature:
+    def test_one_matches_no_temperature(self):
+        scores = np.array([0.1, 0.4, 0.75, 1.0])
+        a = ScoreSampler._select_probabilistic(
+            scores, 5000, replace=True, rng=np.random.default_rng(1)
+        )
+        b = ScoreSampler._select_probabilistic(
+            scores, 5000, replace=True, rng=np.random.default_rng(1), temperature=1.0
+        )
+        np.testing.assert_array_equal(a, b)
+
+    def test_zero_is_uniform_over_positive(self):
+        scores = np.array([0.1, 0.4, 0.75, 1.0])
+        rng = np.random.default_rng(42)
+        idx = ScoreSampler._select_probabilistic(
+            scores, 200_000, replace=True, rng=rng, temperature=0.0
+        )
+        freq = np.bincount(idx, minlength=4) / len(idx)
+        np.testing.assert_allclose(freq, np.full(4, 0.25), atol=0.01)
+
+    def test_zero_does_not_resurrect_floored_scores(self):
+        # 0**0 == 1 in numpy; the mask must keep score-0 items dropped at beta=0.
+        scores = np.array([0.0, 0.0, 0.5, 1.0])
+        idx = ScoreSampler._select_probabilistic(
+            scores, 1000, replace=True, rng=np.random.default_rng(0), temperature=0.0
+        )
+        assert set(idx.tolist()) == {2, 3}
+
+    def test_higher_temperature_concentrates_on_top(self):
+        scores = np.array([0.25, 0.5, 1.0])
+        top_share = []
+        for beta in (1.0, 2.0, 4.0):
+            idx = ScoreSampler._select_probabilistic(
+                scores, 50_000, replace=True, rng=np.random.default_rng(7), temperature=beta
+            )
+            top_share.append((idx == 2).mean())
+        assert top_share[0] < top_share[1] < top_share[2]
+
+    def test_negative_temperature_raises(self):
+        with pytest.raises(ValueError, match="temperature must be >= 0"):
+            ScoreSampler._select_probabilistic(
+                np.array([0.5, 1.0]), 4, replace=True,
+                rng=np.random.default_rng(0), temperature=-1.0,
+            )
+
+    def test_config_reads_temperature_field(self, tmp_path):
+        cfg = tmp_path / "c.yaml"
+        cfg.write_text(
+            "temperature: 2.5\nnormalize: false\n"
+            "columns:\n  content_quality:\n    category_scores:\n      good: 1.0\n"
+        )
+        assert ScoringConfig.from_file(cfg).temperature == 2.5
+        # default when omitted
+        assert DEFAULT_SCORING_CONFIG.temperature == 1.0
+
+
 class TestSelectProbabilistic:
     def test_reproducible_with_seed(self):
         scores = np.array([0.1, 0.5, 0.9, 0.3])
@@ -792,6 +848,8 @@ class TestApplyIntegration:
                 source_rows=100,
                 selected_rows=100,
                 scores_after=np.array([0.1, 0.5, 0.9]),
+                scores_before=np.array([0.1, 0.5, 0.9]),
+                gather_indices=np.array([0, 1, 2]),
                 max_duplications=3,
             )
             write_dataset_card(info, tmpdir)
@@ -814,6 +872,8 @@ class TestApplyIntegration:
             source_rows=100,
             selected_rows=10,
             scores_after=np.array([0.1, 0.5, 0.9]),
+            scores_before=np.array([0.1, 0.5, 0.9]),
+            gather_indices=np.array([0, 1, 2]),
             max_duplications=3,
         )
         assert info.max_duplications == 3
@@ -829,6 +889,8 @@ class TestApplyIntegration:
             source_rows=100,
             selected_rows=10,
             scores_after=np.array([0.1, 0.5, 0.9]),
+            scores_before=np.array([0.1, 0.5, 0.9]),
+            gather_indices=np.array([0, 1, 2]),
         )
         assert info2.max_duplications is None
 
@@ -1143,3 +1205,151 @@ class TestWriterCLI:
         ann_path = os.path.join(tmpdir, "ann.parquet")
         ann_df.to_parquet(ann_path)
         return ds, ann_path, ann_df
+
+
+class TestDatasetCardContents:
+    """The before→after composition table and coverage/resampling profile."""
+
+    def _info(self, **kw):
+        from propella_curation.dataset_card import CurationInfo
+
+        base = dict(
+            name="x", source_dataset="s", annotations_path="a", config_name="c",
+            mode="sample_with_replacement", threshold=None, n_samples=None, seed=0,
+            source_rows=10, selected_rows=10,
+            scores_after=np.array([1.0] * 5 + [0.75] * 5),
+            scores_before=np.array([1.0] * 2 + [0.75] * 6 + [0.4] * 2),
+            gather_indices=np.arange(10),
+        )
+        base.update(kw)
+        return CurationInfo(**base)
+
+    def test_composition_table_discrete_with_labels(self):
+        from propella_curation.dataset_card import _composition_section
+
+        s = _composition_section(
+            self._info(score_labels={1.0: "excellent", 0.75: "good", 0.4: "adequate"})
+        )
+        assert "| excellent |" in s and "| good |" in s and "| adequate |" in s
+        assert "Mean score:" in s
+        # adequate is present before (2/10) but dropped after (0/10)
+        assert "adequate | 2 (20.0%) | 0 (0.0%)" in s
+
+    def test_composition_continuous_fallback(self):
+        from propella_curation.dataset_card import _composition_section
+
+        info = self._info(
+            scores_before=np.linspace(0, 1, 500), scores_after=np.linspace(0, 1, 500)
+        )
+        s = _composition_section(info)
+        assert "p50=" in s and "Std=" in s  # percentile summary
+        assert "tier / score" not in s  # not a table
+
+    def test_resampling_profile_counts(self):
+        from propella_curation.dataset_card import _resampling_section
+
+        gi = np.array([0, 0, 0, 1, 1, 2])  # row0 ×3, row1 ×2, row2 ×1
+        s = _resampling_section(
+            self._info(gather_indices=gi, source_rows=10, selected_rows=6,
+                       scores_after=np.zeros(6), scores_before=np.zeros(10))
+        )
+        assert "unique source rows:  3 (30.0% of source)" in s
+        assert "dropped source rows: 7" in s
+        assert "max copies of a row: 3" in s
+        assert "1×1" in s and "2×1" in s and "3×1" in s
+
+    def test_value_label_map(self):
+        from propella_curation.score_sampler import (
+            ColumnScoring, ScoringConfig, value_label_map,
+        )
+
+        single = ScoringConfig(
+            columns={"content_quality": ColumnScoring(
+                category_scores={"good": 0.75, "excellent": 1.0})},
+            normalize=False,
+        )
+        m = value_label_map(single)
+        assert m[1.0] == "excellent" and m[0.75] == "good"
+        # normalize=True -> ambiguous -> empty
+        assert value_label_map(
+            ScoringConfig(columns=single.columns, normalize=True)
+        ) == {}
+        # multi-column -> empty
+        multi = ScoringConfig(
+            columns={"a": ColumnScoring(category_scores={"x": 1.0}),
+                     "b": ColumnScoring(category_scores={"y": 1.0})},
+            normalize=False,
+        )
+        assert value_label_map(multi) == {}
+
+
+class TestSystematicResampling:
+    def test_expected_counts_are_floor_or_ceil(self):
+        probs = np.array([0.5, 0.3, 0.2])
+        n = 1000
+        idx = ScoreSampler._systematic_resample(probs, n, np.random.default_rng(0))
+        counts = np.bincount(idx, minlength=3)
+        assert counts.sum() == n
+        lam = probs * n
+        for c, l in zip(counts, lam):
+            assert np.floor(l) <= c <= np.ceil(l)
+
+    def test_uniform_at_n_equals_N_reproduces_each_once(self):
+        # every item has λ=1 -> systematic gives exactly one copy of each (100% coverage)
+        N = 500
+        probs = np.full(N, 1.0 / N)
+        idx = ScoreSampler._systematic_resample(probs, N, np.random.default_rng(3))
+        counts = np.bincount(idx, minlength=N)
+        assert set(counts.tolist()) == {1}  # no drops, no duplicates
+
+    def test_coverage_beats_iid_for_same_weights(self):
+        rng_w = np.random.default_rng(1)
+        scores = rng_w.random(2000) ** 2  # skewed weights
+        n = len(scores)
+        sysn = ScoreSampler._select_probabilistic(
+            scores, n, replace=True, rng=np.random.default_rng(0), sampling="systematic"
+        )
+        iid = ScoreSampler._select_probabilistic(
+            scores, n, replace=True, rng=np.random.default_rng(0), sampling="iid"
+        )
+        assert len(np.unique(sysn)) > len(np.unique(iid))
+
+    def test_zero_scores_never_selected(self):
+        scores = np.array([0.0, 1.0, 0.0, 2.0])
+        idx = ScoreSampler._select_probabilistic(
+            scores, 100, replace=True, rng=np.random.default_rng(0), sampling="systematic"
+        )
+        assert set(idx.tolist()) == {1, 3}
+
+    def test_systematic_with_max_duplications_raises(self):
+        with pytest.raises(ValueError, match="not supported with sampling='systematic'"):
+            ScoreSampler._select_probabilistic(
+                np.array([0.5, 1.0]), 4, replace=True,
+                rng=np.random.default_rng(0), sampling="systematic", max_duplications=2,
+            )
+
+    def test_reproducible_with_seed(self):
+        scores = np.array([0.1, 0.5, 0.9, 0.3])
+        a = ScoreSampler._select_probabilistic(
+            scores, 50, replace=True, rng=np.random.default_rng(7), sampling="systematic"
+        )
+        b = ScoreSampler._select_probabilistic(
+            scores, 50, replace=True, rng=np.random.default_rng(7), sampling="systematic"
+        )
+        np.testing.assert_array_equal(a, b)
+
+    def test_invalid_sampling_raises(self):
+        with pytest.raises(ValueError, match="sampling must be"):
+            ScoreSampler._select_probabilistic(
+                np.array([0.5, 1.0]), 4, replace=True,
+                rng=np.random.default_rng(0), sampling="bogus",
+            )
+
+    def test_config_reads_sampling_field(self, tmp_path):
+        cfg = tmp_path / "c.yaml"
+        cfg.write_text(
+            "sampling: systematic\nnormalize: false\n"
+            "columns:\n  content_quality:\n    category_scores:\n      good: 1.0\n"
+        )
+        assert ScoringConfig.from_file(cfg).sampling == "systematic"
+        assert DEFAULT_SCORING_CONFIG.sampling == "iid"

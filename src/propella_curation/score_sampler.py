@@ -70,6 +70,10 @@ class ScoringConfig:
     )
     missing_id_score: float = 0.0  # score assigned when an ID has no annotation
     normalize: bool = True  # min-max rescale final scores to [0, 1]
+    temperature: float = 1.0  # selection tilt: P(select i) ∝ score_i ** temperature
+    # how to draw with replacement: 'iid' (multinomial) or 'systematic'
+    # (low-variance / stratified — same expected counts, max unique coverage)
+    sampling: Literal["iid", "systematic"] = "iid"
 
     @classmethod
     def from_file(cls, path: str | Path) -> ScoringConfig:
@@ -104,10 +108,30 @@ class ScoringConfig:
             aggregation=raw.get("aggregation", "weighted_mean"),
             missing_id_score=raw.get("missing_id_score", 0.0),
             normalize=raw.get("normalize", True),
+            temperature=raw.get("temperature", 1.0),
+            sampling=raw.get("sampling", "iid"),
         )
 
 
 DEFAULT_SCORING_CONFIG = ScoringConfig.from_name("default")
+
+
+def value_label_map(config: ScoringConfig) -> Dict[float, str]:
+    """Map composite score values back to tier labels, when unambiguous.
+
+    Only single-column configs with ``normalize=False`` have a clean
+    score→label correspondence (the composite equals the column's category
+    score verbatim). For anything else this returns an empty map and the
+    dataset card falls back to numeric value labels. Values are rounded to 6
+    decimals to match the card's grouping.
+    """
+    if len(config.columns) != 1 or config.normalize:
+        return {}
+    (col,) = tuple(config.columns.values())
+    inv: Dict[float, list[str]] = {}
+    for label, val in col.category_scores.items():
+        inv.setdefault(round(float(val), 6), []).append(label)
+    return {v: "/".join(sorted(names)) for v, names in inv.items()}
 
 
 # ============================================================
@@ -176,6 +200,48 @@ class ScoreSampler:
 
         return result
 
+    def score_dataset(
+        self, dataset: Dataset, annotations_path: str, *, force: bool = False
+    ) -> np.ndarray:
+        """Compute the per-row composite score array for ``dataset`` (dataset order).
+
+        Loads the annotations, maps each dataset ``id`` to its composite score
+        (ids without an annotation get ``config.missing_id_score``), prints the
+        match rate, and raises if fewer than 20% of ids match (unless ``force``).
+        Exposed separately so callers (e.g. ``main`` building the dataset card)
+        can obtain the pre-selection scores without re-running the join.
+        """
+        ann_df = self.load_annotations(annotations_path)
+        score_series = self.compute_scores(ann_df)
+        print(f"  Annotations loaded: {len(ann_df):,}")
+
+        dataset_ids = dataset["id"]
+        id_to_score = score_series.to_dict()
+        scores = np.array(
+            [id_to_score.get(did, self.config.missing_id_score) for did in dataset_ids]
+        )
+        n_matched = sum(1 for did in dataset_ids if did in id_to_score)
+        match_rate = n_matched / len(dataset_ids) if dataset_ids else 0.0
+        print(f"  Dataset size:       {len(dataset_ids):,}")
+        print(f"  IDs matched:        {n_matched:,} ({match_rate * 100:.1f}%)")
+
+        if match_rate < 0.2:
+            msg = (
+                f"Only {match_rate * 100:.1f}% of dataset IDs have annotations. "
+                f"Check that the annotation file matches the dataset."
+            )
+            if force:
+                logger.warning(msg + " Continuing because force=True.")
+            else:
+                raise ValueError(msg)
+        elif match_rate < 0.9:
+            logger.warning(
+                f"{match_rate * 100:.1f}% of dataset IDs have annotations — "
+                f"{len(dataset_ids) - n_matched:,} examples will receive a score of "
+                f"{self.config.missing_id_score}."
+            )
+        return scores
+
     # ------------------------------------------------------------------
     # Selection strategies
     # ------------------------------------------------------------------
@@ -185,15 +251,53 @@ class ScoreSampler:
         return np.where(scores >= threshold)[0]
 
     @staticmethod
+    def _systematic_resample(
+        probs: np.ndarray, n_samples: int, rng: np.random.Generator
+    ) -> np.ndarray:
+        """Low-variance (stratified) resampling with replacement.
+
+        ``probs`` must be a normalized probability vector. Returns an index
+        array of length ``n_samples`` whose per-item counts are each
+        ``floor(λ_i)`` or ``ceil(λ_i)`` with ``λ_i = n_samples · probs_i`` and
+        ``E[count_i] = λ_i`` — the *same* expected composition as i.i.d.
+        multinomial draws, but with minimal variance: no item is ever drawn
+        more than ``ceil(λ_i)`` times, which maximizes unique coverage and
+        removes wasted duplicates. (Kitagawa 1996 systematic resampling.)
+        """
+        lam = probs * n_samples  # expected counts, sum == n_samples
+        cum = np.cumsum(lam)
+        # n_samples equally spaced points, one random offset u ∈ [0, 1).
+        positions = rng.random() + np.arange(n_samples)
+        bins = np.searchsorted(cum, positions, side="right")
+        np.clip(bins, 0, len(lam) - 1, out=bins)  # guard float drift at the tail
+        counts = np.bincount(bins, minlength=len(lam))
+        indices = np.repeat(np.arange(len(lam)), counts)
+        rng.shuffle(indices)
+        return indices
+
+    @staticmethod
     def _select_probabilistic(
         scores: np.ndarray,
         n_samples: int,
         replace: bool,
         rng: np.random.Generator,
         max_duplications: Optional[int] = None,
+        temperature: float = 1.0,
+        sampling: str = "iid",
     ) -> np.ndarray:
-        probs = scores.copy()
+        if temperature < 0:
+            raise ValueError(f"temperature must be >= 0, got {temperature}")
+        if sampling not in ("iid", "systematic"):
+            raise ValueError(f"sampling must be 'iid' or 'systematic', got '{sampling}'")
+        probs = scores.copy().astype(float)
         probs[probs < 0] = 0.0
+        # Temperature tilt: P(select i) ∝ score_i ** temperature.
+        # Apply the exponent only to strictly-positive scores so that a score
+        # of exactly 0 (a hard floor / disqualified tier) stays 0 for every
+        # temperature — crucially at temperature=0, where 0**0 would be 1.
+        if temperature != 1.0:
+            pos = probs > 0
+            probs[pos] = probs[pos] ** temperature
         total = probs.sum()
         if total == 0:
             raise ValueError(
@@ -213,6 +317,15 @@ class ScoreSampler:
             return rng.choice(len(scores), size=n_samples, replace=False, p=probs)
 
         # replace=True
+        if sampling == "systematic":
+            if max_duplications is not None:
+                raise ValueError(
+                    "max_duplications is not supported with sampling='systematic' "
+                    "(systematic resampling already bounds each item's count to "
+                    "ceil(expected count))"
+                )
+            return ScoreSampler._systematic_resample(probs, n_samples, rng)
+
         if max_duplications is None:
             return rng.choice(len(scores), size=n_samples, replace=True, p=probs)
 
@@ -277,6 +390,7 @@ class ScoreSampler:
         seed: int = 42,
         force: bool = False,
         max_duplications: Optional[int] = None,
+        precomputed_scores: Optional[np.ndarray] = None,
     ) -> tuple[Dataset, np.ndarray, np.ndarray]:
         """Apply score-based selection.
 
@@ -300,37 +414,13 @@ class ScoreSampler:
                 f"got mode='{mode}'"
             )
 
-        # 1. Load annotations & compute scores
-        ann_df = self.load_annotations(annotations_path)
-        score_series = self.compute_scores(ann_df)
-        print(f"  Annotations loaded: {len(ann_df):,}")
-
-        # 2. Map dataset ids to scores (preserving dataset order)
-        dataset_ids = dataset["id"]
-        id_to_score = score_series.to_dict()
-        scores = np.array(
-            [id_to_score.get(did, self.config.missing_id_score) for did in dataset_ids]
-        )
-        n_matched = sum(1 for did in dataset_ids if did in id_to_score)
-        match_rate = n_matched / len(dataset_ids) if dataset_ids else 0.0
-        print(f"  Dataset size:       {len(dataset_ids):,}")
-        print(f"  IDs matched:        {n_matched:,} ({match_rate * 100:.1f}%)")
-
-        if match_rate < 0.2:
-            msg = (
-                f"Only {match_rate * 100:.1f}% of dataset IDs have annotations. "
-                f"Check that the annotation file matches the dataset."
-            )
-            if force:
-                logger.warning(msg + " Continuing because force=True.")
-            else:
-                raise ValueError(msg)
-        elif match_rate < 0.9:
-            logger.warning(
-                f"{match_rate * 100:.1f}% of dataset IDs have annotations — "
-                f"{len(dataset_ids) - n_matched:,} examples will receive a score of "
-                f"{self.config.missing_id_score}."
-            )
+        # 1-2. Per-row composite scores (dataset order). Allow the caller to
+        # pass a precomputed array (e.g. main() reuses it for the dataset card)
+        # to avoid loading and joining the annotations twice.
+        if precomputed_scores is None:
+            scores = self.score_dataset(dataset, annotations_path, force=force)
+        else:
+            scores = np.asarray(precomputed_scores, dtype=float)
 
         self._print_score_distribution(scores, label="before selection")
 
@@ -341,8 +431,13 @@ class ScoreSampler:
         elif mode == "sample_without_replacement":
             n = n_samples if n_samples is not None else len(dataset)
             rng = np.random.default_rng(seed)
-            indices = self._select_probabilistic(scores, n, replace=False, rng=rng)
-            print(f"\n  Mode: sample without replacement (n={n:,}, seed={seed})")
+            indices = self._select_probabilistic(
+                scores, n, replace=False, rng=rng, temperature=self.config.temperature
+            )
+            print(
+                f"\n  Mode: sample without replacement "
+                f"(n={n:,}, seed={seed}, temperature={self.config.temperature})"
+            )
         elif mode == "sample_with_replacement":
             n = n_samples if n_samples is not None else len(dataset)
             rng = np.random.default_rng(seed)
@@ -352,11 +447,17 @@ class ScoreSampler:
                 replace=True,
                 rng=rng,
                 max_duplications=max_duplications,
+                temperature=self.config.temperature,
+                sampling=self.config.sampling,
             )
             cap_str = (
                 f", max_dup={max_duplications}" if max_duplications is not None else ""
             )
-            print(f"\n  Mode: sample with replacement (n={n:,}, seed={seed}{cap_str})")
+            print(
+                f"\n  Mode: sample with replacement "
+                f"(n={n:,}, seed={seed}, temperature={self.config.temperature}, "
+                f"sampling={self.config.sampling}{cap_str})"
+            )
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -643,6 +744,24 @@ def main() -> None:
         "n_samples is capped to that capacity and a warning is printed.",
     )
     optional.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Selection tilt for sampling modes: P(select) ∝ score**temperature. "
+        "1.0 = proportional to score (default), 0.0 = uniform over score>0, "
+        ">1 concentrates on high scores. Overrides the 'temperature' field in the "
+        "scoring config if given.",
+    )
+    optional.add_argument(
+        "--sampling",
+        choices=["iid", "systematic"],
+        default=None,
+        help="With-replacement draw method: 'iid' (multinomial, default) or "
+        "'systematic' (low-variance/stratified — same expected composition but "
+        "maximal unique coverage and minimal duplication). Overrides the "
+        "'sampling' field in the scoring config if given.",
+    )
+    optional.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -683,6 +802,14 @@ def main() -> None:
     else:
         config = ScoringConfig.from_name(args.config)
 
+    # CLI --temperature / --sampling override the scoring config when given.
+    if args.temperature is not None:
+        config.temperature = args.temperature
+    if args.sampling is not None:
+        config.sampling = args.sampling
+    print(f"  Temperature: {config.temperature}")
+    print(f"  Sampling:    {config.sampling}")
+
     # Load dataset — local parquet directory or HF name
     print(f"\nLoading dataset from {args.dataset_path} ...")
     if os.path.exists(args.dataset_path):
@@ -707,6 +834,9 @@ def main() -> None:
     rows_per_shard = max(1, len(ds) // n_source_files)
 
     sampler = ScoreSampler(config=config)
+    # Compute the per-row scores once and reuse them for both selection and the
+    # dataset card's before→after composition (avoids a second annotation join).
+    scores_before = sampler.score_dataset(ds, args.annotations_path, force=args.force)
     filtered, scores_after, gather_indices = sampler.apply(
         ds,
         annotations_path=args.annotations_path,
@@ -716,6 +846,7 @@ def main() -> None:
         seed=args.seed,
         force=args.force,
         max_duplications=args.max_duplications,
+        precomputed_scores=scores_before,
     )
 
     # `gather_indices` from apply() is already in source-table coordinates.
@@ -790,8 +921,13 @@ def main() -> None:
         source_rows=len(ds),
         selected_rows=len(filtered),
         scores_after=scores_after,
+        scores_before=scores_before,
+        gather_indices=gather_indices,
         max_duplications=args.max_duplications,
         writer=args.writer,
+        temperature=config.temperature,
+        sampling=config.sampling,
+        score_labels=value_label_map(config),
     )
     write_dataset_card(card_info, args.output_dir)
     print(f"  Dataset card written to {args.output_dir}/README.md")
