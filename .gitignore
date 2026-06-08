@@ -28,3 +28,7 @@ logs/
 
 # Personal submission scripts
 submit_curation.sh
+# Generated sweep artifacts (reproducible from the spec YAML)
+sweeps/*/
+sweeps/*.manifest.json
+sweeps/*.submit_all.sh

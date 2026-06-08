@@ -22,6 +22,7 @@ test = ["pytest"]
 
 [project.scripts]
 propella-score-sampler = "propella_curation.score_sampler:main"
+propella-gen-sweep = "propella_curation.sweep_gen:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

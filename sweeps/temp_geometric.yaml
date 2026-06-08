@@ -1,0 +1,46 @@
+# temp_geometric — temperature axis on content_quality, geometric base, NO floor.
+#
+# Single-axis study: vary the selection temperature β over a geometric quality
+# ladder (constant per-step odds e^β), keeping output size = source size.
+# No hard floor: all five tiers keep positive scores, so the bad tail leaks in
+# only at low β and self-extinguishes by β≈2. The floored counterpart
+# (temp_geometric_floored) reruns the low-β points to isolate the tail's effect.
+# See docs/math.md for the full rationale.
+name: temp_geometric
+column: content_quality
+
+# quality ladder, low → high (rank fixes the geometric/linear spacing)
+tiers: [unacceptable, poor, adequate, good, excellent]
+base_shape: geometric
+floor: []                 # sweep 1: no disqualification floor
+
+temperatures: [0, 0.5, 1, 2, 4]
+
+# shared run parameters
+mode: sample_with_replacement
+n_samples: null           # null → keep output size = source size (n = N)
+max_duplications: null     # no cap: temperature is the only lever in sweep 1
+seed: 42
+writer: load              # preserves draw order (matters for the order analysis)
+
+# scoring-config knobs (temperature acts on the composite; no rescaling)
+aggregation: weighted_mean
+normalize: false
+missing_id_score: 0.0
+weight: 1.0
+# systematic (stratified) resampling: same expected composition as iid, but
+# maximal unique coverage / minimal duplication (β=0 reproduces the source).
+sampling: systematic
+
+# paths — output_root is the dataset-level dir; the generator appends the
+# self-describing run id (<name>_<sampling>[_floored]) and the per-β leaf, e.g.
+#   .../Dolci-Instruct-SFT-Decont/temp_geometric_sys/b1
+dataset_path: /leonardo_work/OELLM_prod2026/users/knikolao/propella_annotation/data/Dolci-Instruct-SFT-Decont
+annotations_path: /leonardo_work/OELLM_prod2026/users/knikolao/propella_annotation/output/Dolci-Instruct-SFT-annotations/shard000000.parquet
+output_root: /leonardo_work/OELLM_prod2026/users/knikolao/propella_curation/Dolci-Instruct-SFT-Decont
+
+# SLURM overrides forwarded to submit_curation.sh
+slurm:
+  time: "00:30:00"
+  mem: 120G
+  cpus: "8"
