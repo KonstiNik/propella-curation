@@ -1,0 +1,20 @@
+# Graded keep->=-good config: excellent and good are eligible (graded so the
+# temperature can prioritize excellent over good), everything below good is
+# floored to 0 (never selected). temperature=4 makes excellent ~55x more likely
+# than good per draw, so a without-replacement downselect keeps all excellent
+# first, then fills with good:
+#   --mode sample_without_replacement --n_samples <N>
+temperature: 4.0
+aggregation: weighted_mean
+normalize: false
+missing_id_score: 0.0
+columns:
+  content_quality:
+    weight: 1.0
+    default_score: 0.0
+    category_scores:
+      excellent: 1.0
+      good: 0.367879
+      adequate: 0.0
+      poor: 0.0
+      unacceptable: 0.0

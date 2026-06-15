@@ -1,0 +1,16 @@
+# Hard-cut config: keep only content_quality == excellent; drop everything else.
+# Binary keep-map so any threshold in (0, 1] selects exactly the excellent tier.
+# Use with --mode threshold.
+aggregation: weighted_mean
+normalize: false
+missing_id_score: 0.0
+columns:
+  content_quality:
+    weight: 1.0
+    default_score: 0.0
+    category_scores:
+      excellent: 1.0
+      good: 0.0
+      adequate: 0.0
+      poor: 0.0
+      unacceptable: 0.0

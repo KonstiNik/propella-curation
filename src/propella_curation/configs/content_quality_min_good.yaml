@@ -1,0 +1,16 @@
+# Hard-cut config: keep only content_quality >= good (excellent + good),
+# drop adequate / poor / unacceptable. Binary keep-map so any threshold in
+# (0, 1] selects exactly the kept tiers. Use with --mode threshold.
+aggregation: weighted_mean   # one criterion -> passes its score straight through
+normalize: false             # keep scores verbatim (the keep-map is the rule)
+missing_id_score: 0.0        # unmatched id -> 0 -> dropped
+columns:
+  content_quality:
+    weight: 1.0
+    default_score: 0.0       # unrecognised / missing label -> 0 -> dropped
+    category_scores:
+      excellent: 1.0
+      good: 1.0
+      adequate: 0.0
+      poor: 0.0
+      unacceptable: 0.0

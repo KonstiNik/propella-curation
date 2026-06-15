@@ -1,0 +1,17 @@
+# Geometric content_quality ladder (S = e^L / e^4, constant per-step odds e^β
+# under the temperature tilt). Pair with --temperature and a sampling mode;
+# for a without-replacement downselect use --mode sample_without_replacement
+# --n_samples <small>. See docs/math.md.
+aggregation: weighted_mean
+normalize: false
+missing_id_score: 0.0
+columns:
+  content_quality:
+    weight: 1.0
+    default_score: 0.0
+    category_scores:
+      unacceptable: 0.018316
+      poor: 0.049787
+      adequate: 0.135335
+      good: 0.367879
+      excellent: 1.0
